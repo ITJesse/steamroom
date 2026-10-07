@@ -1986,3 +1986,126 @@ async fn a_missing_install_directory_is_created() {
         .unwrap();
     assert!(install.join("game/a.rpy").exists());
 }
+
+/// Serves chunks after a short delay and records the most fetches it ever had
+/// in flight at once.
+struct CountingFetcher {
+    chunks: HashMap<ChunkId, Bytes>,
+    in_flight: std::sync::atomic::AtomicUsize,
+    most_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+impl ChunkFetcher for CountingFetcher {
+    async fn fetch_chunk(&self, _depot_id: DepotId, chunk_id: &ChunkId) -> Result<Bytes, BoxError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.most_in_flight.fetch_max(now, SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        self.in_flight.fetch_sub(1, SeqCst);
+        self.chunks
+            .get(chunk_id)
+            .cloned()
+            .ok_or_else(|| format!("chunk {:?} not found in mock", chunk_id).into())
+    }
+}
+
+#[tokio::test]
+async fn single_chunk_files_are_fetched_concurrently_within_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path();
+    let key = DepotKey([0xAA; 32]);
+    let contents: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; 64 + usize::from(i)]).collect();
+    let mut chunks = HashMap::new();
+    let mut files = Vec::new();
+    for (i, content) in contents.iter().enumerate() {
+        chunks.insert(sha_id(content), enc(content, &key));
+        files.push(file_with_chunks(
+            &format!("game\\file{i}.bin"),
+            vec![chunk_at(content, 0)],
+        ));
+    }
+    let total: u64 = contents.iter().map(|c| c.len() as u64).sum();
+    let manifest = DepotManifest::new(files);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let job = DepotJob::builder()
+        .depot_id(anon::SPACEWAR_DEPOT)
+        .depot_key(key)
+        .install_dir(install.to_path_buf())
+        .max_downloads(4)
+        .non_atomic(true)
+        .event_sender(tx)
+        .build()
+        .unwrap();
+    let fetcher = Arc::new(CountingFetcher {
+        chunks,
+        in_flight: Default::default(),
+        most_in_flight: Default::default(),
+    });
+
+    let stats = job.download(&manifest, fetcher.clone()).await.unwrap();
+    drop(job);
+
+    assert_eq!(stats.files_completed, 16);
+    for (i, content) in contents.iter().enumerate() {
+        assert_eq!(
+            &std::fs::read(install.join(format!("game/file{i}.bin"))).unwrap(),
+            content
+        );
+    }
+    let most = fetcher
+        .most_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(most > 1, "files were fetched one at a time");
+    assert!(most <= 4, "{most} fetches in flight, limit 4");
+    let mut last_progress = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let DownloadEvent::DepotProgress {
+            completed_bytes, ..
+        } = event
+        {
+            assert!(completed_bytes >= last_progress, "progress went back");
+            last_progress = completed_bytes;
+        }
+    }
+    assert_eq!(last_progress, total);
+}
+
+#[test]
+fn staging_names_stay_distinct_for_every_path() {
+    use crate::download::staging_name;
+    assert_eq!(staging_name("plain.bin"), "plain.bin");
+    assert_ne!(staging_name("a/b_c"), staging_name("a_b/c"));
+    assert_ne!(staging_name("a\\b"), staging_name("a%5Cb"));
+    assert_ne!(staging_name("a/b"), staging_name("a%2Fb"));
+}
+
+#[tokio::test]
+async fn paths_that_used_to_share_a_staging_name_download_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path();
+    let key = DepotKey([0xAA; 32]);
+    let first = b"first file content";
+    let second = b"second file, other content";
+    let mut chunks = HashMap::new();
+    chunks.insert(sha_id(first), enc(first, &key));
+    chunks.insert(sha_id(second), enc(second, &key));
+    let manifest = DepotManifest::new(vec![
+        file_with_chunks("a\\b_c", vec![chunk_at(first, 0)]),
+        file_with_chunks("a_b\\c", vec![chunk_at(second, 0)]),
+    ]);
+    let job = DepotJob::builder()
+        .depot_id(anon::SPACEWAR_DEPOT)
+        .depot_key(key)
+        .install_dir(install.to_path_buf())
+        .build()
+        .unwrap();
+
+    let stats = job
+        .download(&manifest, Arc::new(MockFetcher { chunks }))
+        .await
+        .unwrap();
+
+    assert_eq!(stats.files_completed, 2);
+    assert_eq!(std::fs::read(install.join("a/b_c")).unwrap(), first);
+    assert_eq!(std::fs::read(install.join("a_b/c")).unwrap(), second);
+}

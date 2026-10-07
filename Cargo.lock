@@ -3396,6 +3396,7 @@ dependencies = [
  "bytes",
  "dhat",
  "dirs-next",
+ "futures-util",
  "insta",
  "prost",
  "regex",

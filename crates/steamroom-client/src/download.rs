@@ -1,6 +1,7 @@
 use crate::event::DownloadEvent;
 use crate::event::ErrorChain;
 use bytes::Bytes;
+use futures_util::StreamExt;
 use rootcause::Report;
 use rootcause::markers::Mutable;
 use rootcause::markers::SendSync;
@@ -438,7 +439,10 @@ impl DepotJob {
         // issues one `create_dir` per new directory rather than per file.
         let mut dir_cache: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-        for file in &manifest.files {
+        // Files with content are transferred after this pass, several at a
+        // time; everything else is settled here, in manifest order.
+        let mut transfers = Vec::new();
+        for (index, file) in manifest.files.iter().enumerate() {
             let filename = &file.filename;
 
             if !self.file_filter.matches(filename) {
@@ -549,68 +553,45 @@ impl DepotJob {
                 ensure_dir(&mut dir_cache, &self.install_dir, parent)
                     .map_err(|e| report(e).attach(attach_file()))?;
             }
-
-            // Check if file already matches the manifest (skip if up-to-date)
-            let expected_size = file.size;
-            if self.verify && file_matches(&file_path, expected_size, file.content_sha1().as_ref())
-            {
-                // Content matches; reconcile the executable bit so verify also
-                // repairs a file whose flags no longer match the manifest.
-                self.reconcile_flags(flags, &file_path, filename, attach_file)?;
-                self.emit(DownloadEvent::FileSkipped {
-                    filename: filename.to_string(),
-                });
-                stats.files_skipped += 1;
-                stats.bytes_downloaded += expected_size;
-                continue;
-            }
-
-            self.emit(DownloadEvent::FileStarted {
-                filename: filename.to_string(),
-            });
-
-            let file_size = if self.non_atomic {
-                // Written in place: the file itself is both output and reuse
-                // source, so unchanged chunks stay put and are never refetched.
-                // A stale symlink here must go first, or the open would follow
-                // it and write through to the link target. A regular file is
-                // kept so its chunks can be reused in place.
-                remove_stale_symlink(&file_path).map_err(|e| report(e).attach(attach_file()))?;
-                self.download_file_streaming(file, &file_path, None, &cas, &fetcher, &sem)
-                    .await?
-            } else {
-                let staging_dir = self.install_dir.join(".DepotDownloader").join("staging");
-                ensure_dir(&mut dir_cache, &self.install_dir, &staging_dir)
-                    .map_err(|e| report(e).attach(attach_file()))?;
-                // Staging names flatten separators; two source paths could in
-                // principle collide here, but files are processed sequentially
-                // and each staging file is renamed away before the next starts,
-                // so only one is ever live at a time.
-                let staging_path = staging_dir.join(filename.replace(['/', '\\'], "_"));
-
-                // Stage a fresh copy, but seed unchanged chunks from the
-                // currently-installed file so only changed chunks are fetched.
-                let reuse_from = file_path.exists().then_some(file_path.as_path());
-                let size = self
-                    .download_file_streaming(file, &staging_path, reuse_from, &cas, &fetcher, &sem)
-                    .await?;
-
-                replace_file(&staging_path, &file_path)
-                    .map_err(|e| report(e).attach(attach_file()))?;
-                size
-            };
-            self.reconcile_flags(flags, &file_path, filename, attach_file)?;
-            stats.bytes_downloaded += file_size;
-            stats.files_completed += 1;
-
-            self.emit(DownloadEvent::FileCompleted {
-                filename: filename.to_string(),
-            });
-            self.emit(DownloadEvent::DepotProgress {
-                completed_bytes: stats.bytes_downloaded,
-                total_bytes,
+            transfers.push(Transfer {
+                index,
+                path: file_path,
+                flags,
             });
         }
+
+        if !self.non_atomic && !transfers.is_empty() {
+            let staging_dir = self.staging_dir();
+            ensure_dir(&mut dir_cache, &self.install_dir, &staging_dir)
+                .map_err(|e| report(e).attach(format!("staging dir {}", staging_dir.display())))?;
+        }
+
+        // A file of one chunk keeps only one fetch in flight, so files are
+        // transferred concurrently; the chunk semaphore still bounds the
+        // fetches of all of them together. On the first error the remaining
+        // transfers are dropped, which aborts their chunk tasks.
+        let mut running = futures_util::stream::iter(transfers)
+            .map(|transfer| self.transfer_file(manifest, transfer, &cas, &fetcher, &sem))
+            .buffer_unordered(self.max_downloads);
+        while let Some(outcome) = running.next().await {
+            match outcome? {
+                TransferOutcome::Present { filename, size } => {
+                    self.emit(DownloadEvent::FileSkipped { filename });
+                    stats.files_skipped += 1;
+                    stats.bytes_downloaded += size;
+                }
+                TransferOutcome::Written { filename, size } => {
+                    stats.bytes_downloaded += size;
+                    stats.files_completed += 1;
+                    self.emit(DownloadEvent::FileCompleted { filename });
+                    self.emit(DownloadEvent::DepotProgress {
+                        completed_bytes: stats.bytes_downloaded,
+                        total_bytes,
+                    });
+                }
+            }
+        }
+        drop(running);
 
         // Remove files from the old manifest that are absent in the new one
         if let Some(ref old_files) = self.old_manifest_files {
@@ -668,6 +649,88 @@ impl DepotJob {
         Ok(stats)
     }
 
+    fn staging_dir(&self) -> PathBuf {
+        self.install_dir.join(".DepotDownloader").join("staging")
+    }
+
+    /// Bring one file with content up to date: leave it when it already
+    /// matches the manifest, otherwise assemble it from reusable and fetched
+    /// chunks, in place or through the staging directory.
+    async fn transfer_file<F: ChunkFetcher + 'static>(
+        &self,
+        manifest: &DepotManifest,
+        transfer: Transfer,
+        cas: &Cas,
+        fetcher: &std::sync::Arc<F>,
+        sem: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Result<TransferOutcome, DownloadReport> {
+        let Transfer {
+            index,
+            path: file_path,
+            flags,
+        } = transfer;
+        let file = &manifest.files[index];
+        let filename = &file.filename;
+        let attach_file = || format!("file `{}` (size {} bytes)", file.filename, file.size);
+
+        // Check if file already matches the manifest (skip if up-to-date).
+        // Hashing reads the whole file, so it runs off the async workers.
+        if self.verify {
+            let path = file_path.clone();
+            let expected_size = file.size;
+            let expected_sha = file.content_sha1();
+            let matches = tokio::task::spawn_blocking(move || {
+                file_matches(&path, expected_size, expected_sha.as_ref())
+            })
+            .await
+            .map_err(|e| report(e).attach(attach_file()))?;
+            if matches {
+                // Content matches; reconcile the executable bit so verify also
+                // repairs a file whose flags no longer match the manifest.
+                self.reconcile_flags(flags, &file_path, filename, attach_file)?;
+                return Ok(TransferOutcome::Present {
+                    filename: filename.clone(),
+                    size: file.size,
+                });
+            }
+        }
+
+        self.emit(DownloadEvent::FileStarted {
+            filename: filename.to_string(),
+        });
+
+        let file_size = if self.non_atomic {
+            // Written in place: the file itself is both output and reuse
+            // source, so unchanged chunks stay put and are never refetched.
+            // A stale symlink here must go first, or the open would follow
+            // it and write through to the link target. A regular file is
+            // kept so its chunks can be reused in place.
+            remove_stale_symlink(&file_path).map_err(|e| report(e).attach(attach_file()))?;
+            self.download_file_streaming(file, &file_path, None, cas, fetcher, sem)
+                .await?
+        } else {
+            // A partly staged file is picked up again by the next run, so
+            // its name follows from the file's path alone; it is distinct for
+            // every path, so concurrent transfers never share one.
+            let staging_path = self.staging_dir().join(staging_name(filename));
+
+            // Stage a fresh copy, but seed unchanged chunks from the
+            // currently-installed file so only changed chunks are fetched.
+            let reuse_from = file_path.exists().then_some(file_path.as_path());
+            let size = self
+                .download_file_streaming(file, &staging_path, reuse_from, cas, fetcher, sem)
+                .await?;
+
+            replace_file(&staging_path, &file_path).map_err(|e| report(e).attach(attach_file()))?;
+            size
+        };
+        self.reconcile_flags(flags, &file_path, filename, attach_file)?;
+        Ok(TransferOutcome::Written {
+            filename: filename.clone(),
+            size: file_size,
+        })
+    }
+
     /// Streaming chunk download with delta reuse.
     ///
     /// Pre-allocates the output file via `set_len(file.size)`, then writes each
@@ -681,7 +744,9 @@ impl DepotJob {
     /// Only genuinely-changed chunks are fetched.
     ///
     /// Memory is bounded by `max_downloads * (encrypted + decompressed chunk
-    /// size)` plus one reusable scratch buffer. The full file is never resident.
+    /// size)` across all files in progress, plus one reusable scratch buffer
+    /// per file in progress (at most `max_downloads` of them). The full file
+    /// is never resident.
     async fn download_file_streaming<F: ChunkFetcher + 'static>(
         &self,
         file: &ManifestFile,
@@ -770,7 +835,9 @@ impl DepotJob {
             }
         }
 
-        let mut fetch_handles = Vec::with_capacity(to_fetch + usize::from(copy_from_disk > 0));
+        // Dropping the set (an error in another file, or a cancelled job)
+        // aborts the chunk tasks still waiting or fetching.
+        let mut fetch_handles = tokio::task::JoinSet::new();
 
         // Copy reusable chunks off local disk into the output in one blocking
         // pass, concurrently with the network fetches below.
@@ -792,7 +859,7 @@ impl DepotJob {
             let out = out.clone();
             let event_tx = self.event_tx.clone();
             let ctx = attach_file_ctx();
-            fetch_handles.push(tokio::spawn(async move {
+            fetch_handles.spawn(async move {
                 tokio::task::spawn_blocking(move || -> Result<(), DownloadReport> {
                     // `copy_from_disk > 0` gates this task, so `ops` is non-empty.
                     let cap = ops
@@ -814,7 +881,7 @@ impl DepotJob {
                 })
                 .await
                 .map_err(report)?
-            }));
+            });
         }
         // Sources not consumed by the copy task are closed here.
         drop(sources);
@@ -835,7 +902,7 @@ impl DepotJob {
             let fetcher = fetcher.clone();
             let out = out.clone();
 
-            fetch_handles.push(tokio::spawn(async move {
+            fetch_handles.spawn(async move {
                 let attach_chunk = || {
                     format!(
                         "chunk {chunk_id} at offset {chunk_offset} ({expected_size} bytes) of depot {}",
@@ -892,12 +959,12 @@ impl DepotJob {
                 .map_err(|r| r.attach(attach_chunk_for_blocking))?;
 
                 Ok::<(), DownloadReport>(())
-            }));
+            });
         }
 
         let mut first_err: Option<DownloadReport> = None;
-        for h in fetch_handles {
-            match h.await {
+        while let Some(joined) = fetch_handles.join_next().await {
+            match joined {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if first_err.is_none() {
@@ -954,6 +1021,37 @@ impl DepotJob {
 
         Ok(file.size)
     }
+}
+
+/// A file with content, settled and checked by the first pass of
+/// [`DepotJob::download`] and transferred by [`DepotJob::transfer_file`].
+struct Transfer {
+    /// Position in the manifest.
+    index: usize,
+    path: PathBuf,
+    flags: DepotFileFlags,
+}
+
+/// The staging file name for a manifest path: separators flattened into one
+/// name, with `%` escaped first so that no two paths map to the same name
+/// (`a/b_c` and `a_b/c` both flattened to `a_b_c` before).
+pub(crate) fn staging_name(filename: &str) -> String {
+    filename
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace('\\', "%5C")
+}
+
+enum TransferOutcome {
+    /// Already matched the manifest.
+    Present {
+        filename: String,
+        size: u64,
+    },
+    Written {
+        filename: String,
+        size: u64,
+    },
 }
 
 /// Buffer size for the streaming SHA-1 verification pass. Sized to amortize
