@@ -555,6 +555,30 @@ impl SteamClient<LoggedIn> {
         job.recv_expect(response).await
     }
 
+    /// Send a PICS product info request and collect every part of the answer.
+    /// Steam splits large answers into several responses to the same job and
+    /// sets `response_pending` on all but the last.
+    async fn product_info(
+        &self,
+        req: &generated::CMsgClientPicsProductInfoRequest,
+    ) -> Result<Vec<generated::CMsgClientPicsProductInfoResponse>, Error> {
+        let body = req.encode_to_vec();
+        let mut msg = self.make_msg(EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST, &body);
+        let mut job = self.inner.send_job(&mut msg).await?;
+        let mut parts = Vec::new();
+        loop {
+            let incoming = job
+                .recv_expect(EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE)
+                .await?;
+            let part = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
+            let pending = part.response_pending == Some(true);
+            parts.push(part);
+            if !pending {
+                return Ok(parts);
+            }
+        }
+    }
+
     pub async fn send_heartbeat(&self) -> Result<(), Error> {
         let msg = self.make_msg(EMsg::CLIENT_HEART_BEAT, &[]);
         self.inner.send_raw(&msg).await
@@ -610,17 +634,10 @@ impl SteamClient<LoggedIn> {
             meta_data_only: Some(false),
             ..Default::default()
         };
-        let incoming = self
-            .request(
-                EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST,
-                &req.encode_to_vec(),
-                EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
-            )
-            .await?;
-        let resp = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
-        Ok(resp
-            .apps
+        let parts = self.product_info(&req).await?;
+        Ok(parts
             .iter()
+            .flat_map(|part| &part.apps)
             .map(|a| AppInfo {
                 app_id: a.appid.map(AppId),
                 change_number: a.change_number,
@@ -703,22 +720,19 @@ impl SteamClient<LoggedIn> {
             meta_data_only: Some(false),
             ..Default::default()
         };
-        let incoming = self
-            .request(
-                EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST,
-                &req.encode_to_vec(),
-                EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
-            )
-            .await?;
-        let resp = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
+        let parts = self.product_info(&req).await?;
         debug!(
-            "package response: {} packages, unknown: {:?}",
-            resp.packages.len(),
-            resp.unknown_packageids
+            "package response: {} packages in {} part(s), unknown: {:?}",
+            parts.iter().map(|p| p.packages.len()).sum::<usize>(),
+            parts.len(),
+            parts
+                .iter()
+                .flat_map(|p| &p.unknown_packageids)
+                .collect::<Vec<_>>()
         );
-        Ok(resp
-            .packages
+        Ok(parts
             .iter()
+            .flat_map(|part| &part.packages)
             .map(|p| PackageInfo {
                 package_id: p.packageid.map(PackageId),
                 change_number: p.change_number,

@@ -362,3 +362,53 @@ async fn event_buffer_keeps_the_newest_messages() {
     let first = next_event(&events).await;
     assert_eq!(&*first.body, &6u32.to_le_bytes());
 }
+
+#[tokio::test]
+async fn product_info_collects_every_response_part() {
+    let (client, mut server) = logged_in_client().await;
+    let request = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .pics_get_product_info(&[
+                    AccessToken {
+                        app_id: AppId(1),
+                        token: 0,
+                    },
+                    AccessToken {
+                        app_id: AppId(2),
+                        token: 0,
+                    },
+                    AccessToken {
+                        app_id: AppId(3),
+                        token: 0,
+                    },
+                ])
+                .await
+        }
+    });
+    let sent = server.next_sent().await;
+    assert_eq!(sent.emsg, EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST);
+    for (appid, pending) in [(1, true), (2, true), (3, false)] {
+        let body = generated::CMsgClientPicsProductInfoResponse {
+            apps: vec![
+                generated::c_msg_client_pics_product_info_response::AppInfo {
+                    appid: Some(appid),
+                    buffer: Some(vec![appid as u8]),
+                    ..Default::default()
+                },
+            ],
+            response_pending: Some(pending),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        server.push(response_to(
+            sent.header.jobid_source,
+            EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
+            &body,
+        ));
+    }
+    let apps = request.await.unwrap().unwrap();
+    let ids: Vec<u32> = apps.iter().map(|a| a.app_id.unwrap().0).collect();
+    assert_eq!(ids, [1, 2, 3]);
+}
