@@ -12,6 +12,8 @@ use steamroom::client::Ready;
 use steamroom::client::SteamClient;
 use steamroom::client::msg::ClientMsg;
 use steamroom::generated::CMsgClientLogon;
+use steamroom::generated::CMsgIpAddress;
+use steamroom::generated::c_msg_ip_address;
 use steamroom::messages::EMsg;
 use steamroom::types::SteamId;
 
@@ -27,12 +29,13 @@ impl AnonymousLogin {
     /// for `CLIENT_LOG_ON_RESPONSE`.
     pub async fn login(self) -> Result<SteamClient<LoggedIn>, LoginError> {
         let client = establish_ready_client(self.transport).await?;
-        let logon = CMsgClientLogon {
+        let mut logon = CMsgClientLogon {
             protocol_version: Some(PROTOCOL_VERSION),
             cell_id: Some(self.config.cell_id),
             client_os_type: Some(self.config.client_os.proto_value()),
             ..Default::default()
         };
+        apply_login_id(&mut logon, self.config.login_id);
         let steam_id = SteamId::from_parts(1, 10, 0, 0).raw();
         finish_logon(client, logon, steam_id).await
     }
@@ -54,7 +57,7 @@ impl TokenLogin {
     /// it's confusing), wait for `CLIENT_LOG_ON_RESPONSE`.
     pub async fn login(self) -> Result<SteamClient<LoggedIn>, LoginError> {
         let client = establish_ready_client(self.transport).await?;
-        let logon = CMsgClientLogon {
+        let mut logon = CMsgClientLogon {
             protocol_version: Some(PROTOCOL_VERSION),
             cell_id: Some(self.config.cell_id),
             client_os_type: Some(self.config.client_os.proto_value()),
@@ -62,6 +65,7 @@ impl TokenLogin {
             access_token: Some(self.refresh_token),
             ..Default::default()
         };
+        apply_login_id(&mut logon, self.config.login_id);
         let steam_id = SteamId::from_parts(1, 1, 1, 0).raw();
         finish_logon(client, logon, steam_id).await
     }
@@ -91,7 +95,7 @@ impl ApprovedAuth {
             ..
         } = self.tokens;
         let account_name = account_name.ok_or(LoginError::MissingField("account_name"))?;
-        let logon = CMsgClientLogon {
+        let mut logon = CMsgClientLogon {
             protocol_version: Some(PROTOCOL_VERSION),
             cell_id: Some(self.config.cell_id),
             client_os_type: Some(self.config.client_os.proto_value()),
@@ -99,9 +103,30 @@ impl ApprovedAuth {
             access_token: Some(refresh_token),
             ..Default::default()
         };
+        apply_login_id(&mut logon, self.config.login_id);
         let steam_id = SteamId::from_parts(1, 1, 1, 0).raw();
         finish_logon(self.client, logon, steam_id).await
     }
+}
+
+/// XOR mask Steam applies to the private IP in `CMsgClientLogon`.
+const PRIVATE_IP_OBFUSCATION_MASK: u32 = 0xBAAD_F00D;
+
+/// Steam identifies concurrent sessions of one account by the private IP the
+/// client reports (SteamKit calls it the login id). A new logon with the same
+/// value replaces the existing session, so every concurrent connection of an
+/// account needs its own id. Without one the field is left out, which Steam
+/// treats like any other single value.
+fn apply_login_id(logon: &mut CMsgClientLogon, login_id: Option<u32>) {
+    let Some(login_id) = login_id else {
+        return;
+    };
+    let obfuscated = login_id ^ PRIVATE_IP_OBFUSCATION_MASK;
+    logon.obfuscated_private_ip = Some(CMsgIpAddress {
+        ip: Some(c_msg_ip_address::Ip::V4(obfuscated)),
+    });
+    // The Steam client still fills the deprecated field too.
+    logon.deprecated_obfustucated_private_ip = Some(obfuscated);
 }
 
 /// Shared logon: send `CMsgClientLogon`, await `CLIENT_LOG_ON_RESPONSE`.

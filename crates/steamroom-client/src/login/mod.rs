@@ -231,6 +231,10 @@ impl LoginBuilder {
         self
     }
 
+    /// Identifies this connection among the account's concurrent sessions
+    /// (sent as the obfuscated private IP). A logon that reuses the id of a
+    /// live session replaces that session, so give every concurrent
+    /// connection of one account a distinct id.
     pub fn login_id(mut self, id: u32) -> Self {
         self.config.login_id = Some(id);
         self
@@ -343,6 +347,10 @@ impl PreparedLoginBuilder {
         self
     }
 
+    /// Identifies this connection among the account's concurrent sessions
+    /// (sent as the obfuscated private IP). A logon that reuses the id of a
+    /// live session replaces that session, so give every concurrent
+    /// connection of one account a distinct id.
     pub fn login_id(mut self, id: u32) -> Self {
         self.config.login_id = Some(id);
         self
