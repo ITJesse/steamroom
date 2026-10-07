@@ -47,9 +47,12 @@ pub fn list_depot_files(
 
 async fn ws_connect()
 -> Result<steamroom::client::SteamClient<steamroom::client::Encrypted>, steamroom::error::Error> {
-    let servers = steamroom::connection::CmServer::fetch()
-        .await
-        .unwrap_or_else(|_| steamroom::connection::CmServer::defaults());
+    let http = steamroom::http::client()?;
+    let servers =
+        match steamroom::connection::CmServer::fetch(&http, steamroom::depot::CellId(0)).await {
+            Ok(servers) if !servers.is_empty() => servers,
+            _ => steamroom::connection::CmServer::defaults(),
+        };
     let ws = servers
         .iter()
         .find(|s| s.protocol == steamroom::connection::Protocol::WebSocket)

@@ -121,6 +121,13 @@ message CMsgClientLogonResponse {
   optional uint64 family_group_id = 31;
 }
 
+message CMsgClientCMList {
+  repeated uint32 cm_addresses = 1;
+  repeated uint32 cm_ports = 2;
+  repeated string cm_websocket_addresses = 3;
+  optional uint32 percent_default_to_websocket = 4;
+}
+
 message CMsgClientRequestWebAPIAuthenticateUserNonce {
   optional int32 token_type = 1 [default = -1];
 }

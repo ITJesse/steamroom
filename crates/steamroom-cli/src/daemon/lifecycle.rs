@@ -343,6 +343,7 @@ pub async fn serve_resumed(username: String, _cli: Cli) -> Result<(), CliError> 
     } else {
         let token = shared::load_saved_token(&username).ok_or(CliError::InteractiveAuthRequired)?;
         let client = steamroom_client::login::LoginBuilder::new()
+            .cm_servers(shared::discover_cm_servers().await)
             .device_name("steamroom")
             .with_refresh_token(&username, &token)
             .login()

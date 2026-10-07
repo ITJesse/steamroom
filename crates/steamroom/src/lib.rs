@@ -18,7 +18,8 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Discover CM servers and connect
-//! let servers = CmServer::fetch().await?;
+//! let http = steamroom::http::client()?;
+//! let servers = CmServer::fetch(&http, steamroom::depot::CellId(0)).await?;
 //! let ws_server = servers.iter()
 //!     .find(|s| s.protocol == steamroom::connection::Protocol::WebSocket)
 //!     .expect("no WebSocket server");
@@ -59,6 +60,8 @@ pub mod depot;
 pub mod enums;
 /// Error types for all operations.
 pub mod error;
+/// HTTP client construction.
+pub mod http;
 /// Raw Steam protocol message IDs and header parsing.
 pub mod messages;
 /// Process-wide rustls crypto provider installation.

@@ -94,9 +94,11 @@ pub(crate) struct BuilderConfig {
 
 /// How the builder obtains the underlying ready client.
 pub(crate) enum TransportConfig {
-    /// Discover CM servers, connect via preferred protocol, run encryption,
+    /// Connect to one of `servers` via the preferred protocol, run encryption,
     /// then send `CMsgClientHello`.
     Auto {
+        /// Candidate CMs, supplied by the caller.
+        servers: Vec<CmServer>,
         prefer: Protocol,
         allow_fallback: bool,
         /// When set, the chosen transport is wrapped in a
@@ -106,16 +108,6 @@ pub(crate) enum TransportConfig {
     /// Use a pre-built `Ready` client (capture/replay, custom transport). The
     /// caller is responsible for having driven `connect → encrypt → prepare`.
     Provided(SteamClient<Ready>),
-}
-
-impl Default for TransportConfig {
-    fn default() -> Self {
-        Self::Auto {
-            prefer: Protocol::Tcp,
-            allow_fallback: true,
-            recorder: None,
-        }
-    }
 }
 
 use steamroom::connection::CmServer;
@@ -132,25 +124,25 @@ pub(crate) async fn establish_ready_client(
     match transport {
         TransportConfig::Provided(client) => Ok(client),
         TransportConfig::Auto {
+            servers,
             prefer,
             allow_fallback,
             recorder,
-        } => Ok(connect_auto(prefer, allow_fallback, recorder.as_ref())
-            .await?
-            .prepare()
-            .await?),
+        } => Ok(
+            connect_auto(&servers, prefer, allow_fallback, recorder.as_ref())
+                .await?
+                .prepare()
+                .await?,
+        ),
     }
 }
 
 async fn connect_auto(
+    servers: &[CmServer],
     prefer: Protocol,
     allow_fallback: bool,
     recorder: Option<&Recorder>,
 ) -> Result<SteamClient<Encrypted>, LoginError> {
-    let servers = CmServer::fetch()
-        .await
-        .unwrap_or_else(|_| CmServer::defaults());
-
     if let Some(server) = servers.iter().find(|s| s.protocol == prefer) {
         match try_connect(server, recorder).await {
             Ok(client) => return Ok(client),
@@ -200,12 +192,16 @@ async fn try_connect(
     }
 }
 
-/// Top-level builder for the auto-discovery login path: builder discovers
-/// CM servers, connects, runs the encryption handshake, then drives the
-/// chosen auth method. For a pre-built `SteamClient<Ready>`, use
-/// `PreparedLoginBuilder` instead.
+/// Top-level builder for the connect-and-login path: the builder connects to
+/// one of the CM servers given to [`cm_servers`](LoginBuilder::cm_servers),
+/// runs the encryption handshake, then drives the chosen auth method. Where
+/// the servers come from (Steam's directory via `CmServer::fetch`, a cache,
+/// the CM list pushed after an earlier logon, `CmServer::defaults`) is the
+/// caller's decision; the builder does no discovery of its own. For a
+/// pre-built `SteamClient<Ready>`, use `PreparedLoginBuilder` instead.
 pub struct LoginBuilder {
     config: BuilderConfig,
+    servers: Vec<CmServer>,
     transport_prefer: Protocol,
     transport_allow_fallback: bool,
     recorder: Option<Recorder>,
@@ -215,6 +211,7 @@ impl LoginBuilder {
     pub fn new() -> Self {
         Self {
             config: BuilderConfig::default(),
+            servers: Vec::new(),
             transport_prefer: Protocol::Tcp,
             transport_allow_fallback: true,
             recorder: None,
@@ -245,6 +242,13 @@ impl LoginBuilder {
         self
     }
 
+    /// CM servers to connect to. Without any, every login fails with
+    /// [`LoginError::NoCmServers`].
+    pub fn cm_servers(mut self, servers: Vec<CmServer>) -> Self {
+        self.servers = servers;
+        self
+    }
+
     pub fn prefer_protocol(mut self, p: Protocol) -> Self {
         self.transport_prefer = p;
         self
@@ -266,6 +270,7 @@ impl LoginBuilder {
 
     fn transport(&self) -> TransportConfig {
         TransportConfig::Auto {
+            servers: self.servers.clone(),
             prefer: self.transport_prefer,
             allow_fallback: self.transport_allow_fallback,
             recorder: self.recorder.clone(),
@@ -441,6 +446,14 @@ mod tests {
         assert_eq!(b.config.client_os.value(), 99);
         assert_eq!(b.transport_prefer, Protocol::WebSocket);
         assert!(!b.transport_allow_fallback);
+    }
+
+    #[tokio::test]
+    async fn login_without_cm_servers_does_no_discovery() {
+        assert!(matches!(
+            LoginBuilder::new().anonymous().login().await,
+            Err(LoginError::NoCmServers)
+        ));
     }
 
     #[test]

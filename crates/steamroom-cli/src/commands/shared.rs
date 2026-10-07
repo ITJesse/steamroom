@@ -13,6 +13,7 @@ use steamroom::apps::KvDecodeError;
 use steamroom::cdn::CdnClient;
 use steamroom::client::LoggedIn;
 use steamroom::client::SteamClient;
+use steamroom::connection::CmServer;
 use steamroom::depot::manifest::DepotManifest;
 use steamroom::depot::*;
 use steamroom::types::key_value::KeyValue;
@@ -272,12 +273,35 @@ pub async fn fetch_manifest(
     Ok(manifest)
 }
 
+/// CM servers from Steam's directory, or the library's built-in list when the
+/// directory cannot be reached or returns nothing.
+pub async fn discover_cm_servers() -> Vec<CmServer> {
+    let fetched = match steamroom::http::client() {
+        Ok(http) => CmServer::fetch(&http, CellId(0)).await,
+        Err(e) => Err(e),
+    };
+    match fetched {
+        Ok(servers) if !servers.is_empty() => servers,
+        Ok(_) => {
+            warn!("Steam's CM directory returned no servers; using the built-in list");
+            CmServer::defaults()
+        }
+        Err(e) => {
+            warn!("Steam's CM directory is unreachable ({e}); using the built-in list");
+            CmServer::defaults()
+        }
+    }
+}
+
 pub async fn connect_and_login(
     auth: &AuthOptions,
     recorder: Option<&steamroom::transport::recording::Recorder>,
 ) -> Result<SteamClient<LoggedIn>, CliError> {
+    let servers = discover_cm_servers().await;
     let make_builder = || {
-        let b = LoginBuilder::new().device_name(auth.device_name.as_deref().unwrap_or("steamroom"));
+        let b = LoginBuilder::new()
+            .cm_servers(servers.clone())
+            .device_name(auth.device_name.as_deref().unwrap_or("steamroom"));
         match recorder {
             Some(r) => b.record(r.clone()),
             None => b,
@@ -350,7 +374,7 @@ pub async fn connect_and_login(
         if !is_interactive() && auth.password.is_none() {
             return Err(CliError::InteractiveAuthRequired);
         }
-        return drive_credentials_flow(builder, username, auth).await;
+        return drive_credentials_flow(builder, &servers, username, auth).await;
     }
 
     // Auto-detect Steam user with a saved token.
@@ -421,6 +445,7 @@ pub fn forget_saved_token(username: &str) {
 
 pub async fn drive_credentials_flow(
     builder: LoginBuilder,
+    servers: &[CmServer],
     username: &str,
     auth: &AuthOptions,
 ) -> Result<SteamClient<LoggedIn>, CliError> {
@@ -441,6 +466,7 @@ pub async fn drive_credentials_flow(
         };
 
         let credentials = LoginBuilder::new()
+            .cm_servers(servers.to_vec())
             .device_name(auth.device_name.as_deref().unwrap_or("steamroom"))
             .with_credentials(username, password);
         let flow = match credentials.begin().await {

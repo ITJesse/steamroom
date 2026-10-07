@@ -26,6 +26,7 @@ impl EMsg {
     pub const CLIENT_ACCOUNT_INFO: Self = Self(768);
     pub const CLIENT_LICENSE_LIST: Self = Self(780);
     pub const CLIENT_PING: Self = Self(781);
+    pub const CLIENT_CM_LIST: Self = Self(783);
     pub const CLIENT_GET_APP_OWNERSHIP_TICKET: Self = Self(813);
     pub const CLIENT_GET_APP_OWNERSHIP_TICKET_RESPONSE: Self = Self(814);
     pub const CHANNEL_ENCRYPT_REQUEST: Self = Self(1303);
