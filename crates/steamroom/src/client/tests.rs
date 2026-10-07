@@ -412,3 +412,34 @@ async fn product_info_collects_every_response_part() {
     let ids: Vec<u32> = apps.iter().map(|a| a.app_id.unwrap().0).collect();
     assert_eq!(ids, [1, 2, 3]);
 }
+
+#[tokio::test]
+async fn package_info_sends_the_access_tokens() {
+    let (client, mut server) = logged_in_client().await;
+    let request = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .pics_get_package_info(&[PackageAccessToken {
+                    package_id: PackageId(77),
+                    token: 0x1234_5678_9abc,
+                }])
+                .await
+        }
+    });
+    let data = tokio::time::timeout(Duration::from_secs(5), server.peer.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let sent = IncomingMsg::parse(&data).unwrap();
+    let req = generated::CMsgClientPicsProductInfoRequest::decode(&*sent.body).unwrap();
+    assert_eq!(req.packages[0].packageid, Some(77));
+    assert_eq!(req.packages[0].access_token, Some(0x1234_5678_9abc));
+    let body = generated::CMsgClientPicsProductInfoResponse::default().encode_to_vec();
+    server.push(response_to(
+        sent.header.jobid_source,
+        EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
+        &body,
+    ));
+    request.await.unwrap().unwrap();
+}

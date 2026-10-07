@@ -20,6 +20,15 @@ pub struct AccessToken {
     pub token: u64,
 }
 
+/// PICS access token for a package. Owned packages carry theirs in the
+/// license list (`CMsgClientLicenseList.License.access_token`); a token of 0
+/// requests the public view, which omits most of a non-free package.
+#[derive(Clone, Debug)]
+pub struct PackageAccessToken {
+    pub package_id: PackageId,
+    pub token: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppInfo {
     pub app_id: Option<AppId>,

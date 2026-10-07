@@ -6,6 +6,7 @@ use crate::commands::shared::kv_to_json;
 use crate::errors::CliError;
 use crate::sink::JobSink;
 use std::sync::Arc;
+use steamroom::apps::PackageAccessToken;
 use steamroom::client::LoggedIn;
 use steamroom::client::SteamClient;
 use steamroom::depot::*;
@@ -24,7 +25,20 @@ pub async fn run_packages(
 ) -> Result<(), CliError> {
     let ids: Vec<PackageId> = args.packages.iter().map(|&id| PackageId(id)).collect();
     info!("querying {} package(s)...", ids.len());
-    let packages = client.pics_get_package_info(&ids).await?;
+    // Packages Steam denies a token for are still queried, with token 0, for
+    // their public view.
+    let granted = client.pics_get_package_access_tokens(&ids).await?;
+    let tokens: Vec<PackageAccessToken> = ids
+        .iter()
+        .map(|&package_id| PackageAccessToken {
+            package_id,
+            token: granted
+                .iter()
+                .find(|t| t.package_id == package_id)
+                .map_or(0, |t| t.token),
+        })
+        .collect();
+    let packages = client.pics_get_package_info(&tokens).await?;
 
     for pkg in &packages {
         let pkg_id = pkg.package_id.map(|p| p.0).unwrap_or(0);

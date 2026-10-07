@@ -14,6 +14,7 @@ use self::dispatch::Tasks;
 use self::msg::ClientMsg;
 use crate::apps::AccessToken;
 use crate::apps::AppInfo;
+use crate::apps::PackageAccessToken;
 use crate::apps::PackageInfo;
 use crate::auth::AuthClientId;
 use crate::auth::AuthSession;
@@ -678,7 +679,7 @@ impl SteamClient<LoggedIn> {
     pub async fn pics_get_package_access_tokens(
         &self,
         package_ids: &[PackageId],
-    ) -> Result<Vec<(PackageId, u64)>, Error> {
+    ) -> Result<Vec<PackageAccessToken>, Error> {
         let req = generated::CMsgClientPicsAccessTokenRequest {
             packageids: package_ids.iter().map(|p| p.0).collect(),
             ..Default::default()
@@ -694,26 +695,27 @@ impl SteamClient<LoggedIn> {
         Ok(resp
             .package_access_tokens
             .iter()
-            .map(|t| {
-                (
-                    PackageId(t.packageid.unwrap_or(0)),
-                    t.access_token.unwrap_or(0),
-                )
+            .map(|t| PackageAccessToken {
+                package_id: PackageId(t.packageid.unwrap_or(0)), // echoed back from our request
+                token: t.access_token.unwrap_or(0),              // 0 = no token needed
             })
             .collect())
     }
 
+    /// Package details. Without the package's access token Steam returns only
+    /// the public view, which lacks the app and depot lists of most
+    /// non-free packages.
     pub async fn pics_get_package_info(
         &self,
-        package_ids: &[PackageId],
+        packages: &[PackageAccessToken],
     ) -> Result<Vec<PackageInfo>, Error> {
         let req = generated::CMsgClientPicsProductInfoRequest {
-            packages: package_ids
+            packages: packages
                 .iter()
                 .map(
                     |p| generated::c_msg_client_pics_product_info_request::PackageInfo {
-                        packageid: Some(p.0),
-                        access_token: Some(0),
+                        packageid: Some(p.package_id.0),
+                        access_token: Some(p.token),
                     },
                 )
                 .collect(),
