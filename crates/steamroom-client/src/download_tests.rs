@@ -1869,3 +1869,120 @@ async fn delta_prune_does_not_touch_user_dirs() {
     assert!(user_dir.exists());
     assert!(user_dir.join("notes.txt").exists());
 }
+
+fn job_into(install: &std::path::Path) -> DepotJob {
+    DepotJob::builder()
+        .depot_id(anon::SPACEWAR_DEPOT)
+        .depot_key(DepotKey([0; 32]))
+        .install_dir(install.to_path_buf())
+        .build()
+        .unwrap()
+}
+
+fn is_unsafe_path(
+    result: Result<crate::download::DownloadStats, crate::download::DownloadReport>,
+) -> bool {
+    matches!(
+        result.map_err(|report| report.into_current_context()),
+        Err(DownloadError::UnsafePath { .. })
+    )
+}
+
+#[tokio::test]
+async fn paths_leaving_the_install_directory_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("install");
+    std::fs::create_dir(&install).unwrap();
+    for name in [
+        "../escape.txt",
+        "a/../../escape.txt",
+        "/tmp/escape.txt",
+        "..\\escape.txt",
+    ] {
+        let result = job_into(&install)
+            .download(&manifest_with(&[name]), Arc::new(NullFetcher))
+            .await;
+        assert!(is_unsafe_path(result), "{name} was not refused");
+    }
+    assert!(!dir.path().join("escape.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writes_do_not_go_through_a_symlinked_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("install");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&install).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, install.join("game")).unwrap();
+
+    let result = job_into(&install)
+        .download(
+            &manifest_with(&["game/sub/file.txt"]),
+            Arc::new(NullFetcher),
+        )
+        .await;
+    assert!(is_unsafe_path(result));
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinks_pointing_outside_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path();
+    let link = |name: &str, target: &str| {
+        let mut file = ManifestFile::new(name.to_string(), 0);
+        file.flags = DepotFileFlags::SYMLINK.bits();
+        file.link_target = Some(target.to_string());
+        file
+    };
+    let manifest = DepotManifest::new(vec![
+        link("a/inside", "../b/real.bin"),
+        link("a/up", "../../etc"),
+        link("abs", "/etc/passwd"),
+    ]);
+    let stats = job_into(install)
+        .download(&manifest, Arc::new(NullFetcher))
+        .await
+        .unwrap();
+    assert_eq!(stats.files_completed, 1);
+    assert_eq!(stats.files_skipped, 2);
+    assert!(std::fs::symlink_metadata(install.join("a/inside")).is_ok());
+    assert!(std::fs::symlink_metadata(install.join("a/up")).is_err());
+    assert!(std::fs::symlink_metadata(install.join("abs")).is_err());
+}
+
+#[tokio::test]
+async fn old_files_outside_the_install_directory_are_not_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("install");
+    std::fs::create_dir(&install).unwrap();
+    std::fs::write(dir.path().join("precious.txt"), b"keep").unwrap();
+
+    let job = DepotJob::builder()
+        .depot_id(anon::SPACEWAR_DEPOT)
+        .depot_key(DepotKey([0; 32]))
+        .install_dir(install.clone())
+        .old_manifest_files(vec!["../precious.txt".to_string()])
+        .build()
+        .unwrap();
+    let stats = job
+        .download(&manifest_with(&["new.txt"]), Arc::new(NullFetcher))
+        .await
+        .unwrap();
+    assert_eq!(stats.files_removed, 0);
+    assert!(dir.path().join("precious.txt").exists());
+}
+
+#[tokio::test]
+async fn a_missing_install_directory_is_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("not/yet/there");
+    job_into(&install)
+        .download(&manifest_with(&["game/a.rpy"]), Arc::new(NullFetcher))
+        .await
+        .unwrap();
+    assert!(install.join("game/a.rpy").exists());
+}

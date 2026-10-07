@@ -70,6 +70,11 @@ pub enum DownloadError {
 
     #[error("semaphore closed: {0}")]
     Acquire(#[from] tokio::sync::AcquireError),
+
+    /// A manifest path that would leave the install directory: absolute,
+    /// with `..`, or through a directory that is a symlink on disk.
+    #[error("manifest path leaves the install directory: {path}")]
+    UnsafePath { path: String },
 }
 
 /// Wrap any error that converts into [`DownloadError`] as a fresh
@@ -423,9 +428,14 @@ impl DepotJob {
             .map(build_cas)
             .unwrap_or_default();
 
+        // The install directory itself is the caller's and trusted: create it
+        // with its parents. Everything below it goes through `ensure_dir`.
+        std::fs::create_dir_all(&self.install_dir)
+            .map_err(|e| report(e).attach(format!("install dir {}", self.install_dir.display())))?;
+
         // Directories are created lazily on first use and remembered, so a
         // manifest with thousands of files sharing a handful of directories
-        // issues one `create_dir_all` per directory rather than per file.
+        // issues one `create_dir` per new directory rather than per file.
         let mut dir_cache: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         for file in &manifest.files {
@@ -439,15 +449,19 @@ impl DepotJob {
                 continue;
             }
 
-            let file_path = self.install_dir.join(file.normalized_path());
-            let flags = DepotFileFlags::from_bits_retain(file.flags);
-
             let attach_file = || format!("file `{}` (size {} bytes)", file.filename, file.size);
+            let Some(relative) = contained_relative(&file.normalized_path()) else {
+                return Err(report(DownloadError::UnsafePath {
+                    path: file.filename.clone(),
+                }));
+            };
+            let file_path = self.install_dir.join(&relative);
+            let flags = DepotFileFlags::from_bits_retain(file.flags);
 
             if flags.is_directory() {
                 // Explicit directory entries (including empty ones) are always
                 // materialized so the tree matches the manifest exactly.
-                ensure_dir(&mut dir_cache, &file_path)
+                ensure_dir(&mut dir_cache, &self.install_dir, &file_path)
                     .map_err(|e| report(e).attach(attach_file()))?;
                 continue;
             }
@@ -456,8 +470,20 @@ impl DepotJob {
             // before the empty-file branch below -- otherwise they would be
             // written out as empty regular files instead of links.
             if flags.is_symlink() || file.link_target.is_some() {
+                if let Some(target) = file.link_target.as_deref()
+                    && !link_stays_inside(&relative, target)
+                {
+                    tracing::warn!(
+                        "skipping symlink `{filename}`: its target leaves the install directory"
+                    );
+                    stats.files_skipped += 1;
+                    self.emit(DownloadEvent::FileSkipped {
+                        filename: filename.to_string(),
+                    });
+                    continue;
+                }
                 if let Some(parent) = file_path.parent() {
-                    ensure_dir(&mut dir_cache, parent)
+                    ensure_dir(&mut dir_cache, &self.install_dir, parent)
                         .map_err(|e| report(e).attach(attach_file()))?;
                 }
                 match create_symlink(&file_path, file.link_target.as_deref())
@@ -504,7 +530,7 @@ impl DepotJob {
                 }
 
                 if let Some(parent) = file_path.parent() {
-                    ensure_dir(&mut dir_cache, parent)
+                    ensure_dir(&mut dir_cache, &self.install_dir, parent)
                         .map_err(|e| report(e).attach(attach_file()))?;
                 }
 
@@ -520,7 +546,8 @@ impl DepotJob {
             }
 
             if let Some(parent) = file_path.parent() {
-                ensure_dir(&mut dir_cache, parent).map_err(|e| report(e).attach(attach_file()))?;
+                ensure_dir(&mut dir_cache, &self.install_dir, parent)
+                    .map_err(|e| report(e).attach(attach_file()))?;
             }
 
             // Check if file already matches the manifest (skip if up-to-date)
@@ -553,7 +580,7 @@ impl DepotJob {
                     .await?
             } else {
                 let staging_dir = self.install_dir.join(".DepotDownloader").join("staging");
-                ensure_dir(&mut dir_cache, &staging_dir)
+                ensure_dir(&mut dir_cache, &self.install_dir, &staging_dir)
                     .map_err(|e| report(e).attach(attach_file()))?;
                 // Staging names flatten separators; two source paths could in
                 // principle collide here, but files are processed sequentially
@@ -590,7 +617,12 @@ impl DepotJob {
             let new_files: std::collections::HashSet<String> =
                 manifest.files.iter().map(|f| f.normalized_path()).collect();
 
-            for old_name in old_files {
+            // Names that would leave the install directory are never removed.
+            let old_files: Vec<&String> = old_files
+                .iter()
+                .filter(|name| contained_relative(name).is_some())
+                .collect();
+            for old_name in old_files.iter().copied() {
                 if new_files.contains(old_name) {
                     continue;
                 }
@@ -1267,12 +1299,88 @@ fn pwrite_all(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 
 /// `create_dir_all` for `dir`, skipping the syscall once a directory has
 /// already been created in this run.
-fn ensure_dir(cache: &mut std::collections::HashSet<PathBuf>, dir: &Path) -> io::Result<()> {
-    if !cache.contains(dir) {
-        std::fs::create_dir_all(dir)?;
-        cache.insert(dir.to_path_buf());
+/// Create `dir` (inside `root`) and its missing parents, one level at a time,
+/// refusing to go through a symlink: a link placed earlier in the tree must
+/// not redirect writes outside `root`.
+fn ensure_dir(
+    cache: &mut std::collections::HashSet<PathBuf>,
+    root: &Path,
+    dir: &Path,
+) -> Result<(), DownloadError> {
+    if cache.contains(dir) {
+        return Ok(());
+    }
+    let unsafe_path = || DownloadError::UnsafePath {
+        path: dir.display().to_string(),
+    };
+    let relative = dir.strip_prefix(root).map_err(|_| unsafe_path())?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(unsafe_path());
+        };
+        current.push(part);
+        if cache.contains(&current) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(unsafe_path()),
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} is not a directory", current.display()),
+                )
+                .into());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::create_dir(&current) {
+                Ok(()) => {}
+                // Created meanwhile; the next run checks it again.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            },
+            Err(e) => return Err(e.into()),
+        }
+        cache.insert(current.clone());
     }
     Ok(())
+}
+
+/// `path` as a relative path made of plain components, or `None` when it is
+/// absolute, empty, or has `..` (it would leave the install directory).
+fn contained_relative(path: &str) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
+/// Whether a symlink at `link` (relative to the install directory) pointing
+/// at `target` resolves inside the install directory, judged lexically.
+fn link_stays_inside(link: &Path, target: &str) -> bool {
+    let target = target.replace('\\', "/");
+    let target = Path::new(&target);
+    if target.is_absolute() {
+        return false;
+    }
+    let mut depth = link.parent().map_or(0, |p| p.components().count());
+    for component in target.components() {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match depth.checked_sub(1) {
+                Some(up) => depth = up,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Create a symlink at `path` pointing at `target`, replacing any existing
