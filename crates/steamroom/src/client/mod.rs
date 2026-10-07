@@ -566,7 +566,15 @@ impl SteamClient<Ready> {
 }
 
 impl SteamClient<LoggedIn> {
-    fn make_msg<'a>(&self, emsg: EMsg, body: &'a [u8]) -> ClientMsg<'a> {
+    /// SteamID the CM assigned at logon.
+    pub fn steam_id(&self) -> SteamId {
+        SteamId::new(self.inner.steam_id.load(Ordering::Relaxed))
+    }
+
+    /// A message carrying this session's SteamID and session id, ready for
+    /// [`send_msg`](Self::send_msg) or [`send_job`](Self::send_job). For
+    /// messages this crate does not wrap.
+    pub fn make_msg<'a>(&self, emsg: EMsg, body: &'a [u8]) -> ClientMsg<'a> {
         let mut msg = ClientMsg::with_body(emsg, body);
         msg.header.steamid = Some(self.inner.steam_id.load(Ordering::Relaxed));
         msg.header.client_sessionid = Some(self.inner.session_id.load(Ordering::Relaxed));

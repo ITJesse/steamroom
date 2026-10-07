@@ -528,3 +528,12 @@ async fn automatic_placement_sends_neither_cell_nor_override() {
     assert_eq!(req.ip_override, None);
     assert_eq!(req.cell_id, None);
 }
+
+#[tokio::test]
+async fn logged_in_client_reports_its_steam_id_and_stamps_messages() {
+    let (client, _server) = logged_in_client().await;
+    assert_eq!(client.steam_id().raw(), 76561197960287930);
+    let msg = client.make_msg(EMsg::CLIENT_PERSONA_STATE, b"");
+    assert_eq!(msg.header.steamid, Some(76561197960287930));
+    assert_eq!(msg.header.client_sessionid, Some(42));
+}
