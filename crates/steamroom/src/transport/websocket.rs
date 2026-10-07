@@ -41,6 +41,13 @@ impl WebSocketTransport {
                 ))
             })?;
 
+        match ws.get_ref() {
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp) => super::enable_keepalive(tcp),
+            tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
+                super::enable_keepalive(tls.get_ref().0)
+            }
+            _ => {}
+        }
         let (sink, stream) = ws.split();
         Ok(Self {
             sink: Mutex::new(sink),

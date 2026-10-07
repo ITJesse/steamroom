@@ -57,6 +57,7 @@ async-channel = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-platform-verifier = { workspace = true }
+socket2 = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 

@@ -33,6 +33,7 @@ impl TcpTransport {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(ConnectionError::Io)?;
+        super::enable_keepalive(&stream);
 
         let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
