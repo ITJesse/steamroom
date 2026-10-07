@@ -10,8 +10,11 @@ use super::download::RplnetDownloadObserver;
 use super::download::RplnetDownloadRequest;
 use super::download::RplnetDownloadResult;
 use super::library;
+use super::library::RplnetAppVersion;
 use super::library::RplnetDepotCandidate;
 use super::library::RplnetOwnedGame;
+use super::update::RplnetUpdatePlan;
+use super::update::RplnetUpdateRequest;
 use crate::error::RplnetError;
 use crate::error::RplnetSteamFailure;
 use prost::Message;
@@ -265,6 +268,45 @@ impl RplnetSteamSession {
         cancellation: Arc<RplnetCancellation>,
     ) -> Result<RplnetDownloadResult, RplnetError> {
         super::download::download(
+            &self.content,
+            &self.client,
+            &request,
+            observer,
+            &cancellation,
+        )
+        .await
+    }
+
+    /// What Steam lists now for the public branch of each of `app_ids`, for
+    /// telling whether imported stories are behind. Apps Steam returns
+    /// nothing for are left out.
+    pub async fn app_versions(
+        &self,
+        app_ids: Vec<u32>,
+    ) -> Result<Vec<RplnetAppVersion>, RplnetError> {
+        library::app_versions(&self.client, &app_ids).await
+    }
+
+    /// Fetch the manifest an update goes to and work out what it changes;
+    /// see [`RplnetUpdateRequest`]. Fails with `NotRenPy` when the new build
+    /// has no Ren'Py game.
+    pub async fn plan_update(
+        &self,
+        request: RplnetUpdateRequest,
+    ) -> Result<RplnetUpdatePlan, RplnetError> {
+        super::update::plan(&self.content, &self.client, &request).await
+    }
+
+    /// Download the files an update changes into its destination; see
+    /// [`RplnetUpdateRequest`]. Fails with `Cancelled` once `cancellation`
+    /// fires.
+    pub async fn update(
+        &self,
+        request: RplnetUpdateRequest,
+        observer: Arc<dyn RplnetDownloadObserver>,
+        cancellation: Arc<RplnetCancellation>,
+    ) -> Result<RplnetUpdatePlan, RplnetError> {
+        super::update::update(
             &self.content,
             &self.client,
             &request,

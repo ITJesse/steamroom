@@ -40,6 +40,8 @@ pub struct RplnetOwnedGame {
     pub change_number: u32,
     /// Build of the public branch, when Steam lists it.
     pub build_id: Option<u32>,
+    /// When the public branch got that build, in seconds since 1970.
+    pub build_time: Option<i64>,
     /// Every license for it belongs to another account (Steam Family); its
     /// content cannot be downloaded with this account.
     pub family_shared: bool,
@@ -211,12 +213,8 @@ fn game_from(
         app_id,
         name,
         change_number,
-        build_id: kv
-            .get("depots")
-            .and_then(|depots| depots.get("branches"))
-            .and_then(|branches| branches.get("public"))
-            .and_then(|public| number(public.get("buildid")))
-            .and_then(|id| u32::try_from(id).ok()),
+        build_id: public_build_id(kv),
+        build_time: public_build_time(kv),
         family_shared: !packages.is_empty()
             && packages
                 .iter()
@@ -257,10 +255,7 @@ fn rank_depots(
             {
                 return None;
             }
-            let public = depot.get("manifests").and_then(|m| m.get("public"))?;
-            // Newer PICS nests the id as `public/gid`; older has it as the value.
-            let manifest_id = number(public.get("gid")).or_else(|| number(Some(public)))?;
-            let size = number(public.get("size")).or_else(|| number(depot.get("maxsize")));
+            let (manifest_id, size) = public_manifest(depot)?;
             let os_list = text(config.and_then(|c| c.get("oslist"))).unwrap_or_default();
             let os_rank = if os_list.is_empty() {
                 0
@@ -290,6 +285,126 @@ fn rank_depots(
         .collect();
     ranked.sort_by_key(|(rank, candidate)| (*rank, candidate.depot_id));
     ranked.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
+/// What Steam lists now for an app's public branch: enough to tell whether
+/// an imported story is behind (plan 6.7).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RplnetAppVersion {
+    pub app_id: u32,
+    /// PICS change number: changes whenever the app's info changes.
+    pub change_number: u32,
+    pub build_id: Option<u32>,
+    /// When the public branch got that build, in seconds since 1970.
+    pub build_time: Option<i64>,
+    /// Every depot with a public manifest.
+    pub depots: Vec<RplnetDepotVersion>,
+}
+
+/// A depot's public manifest.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RplnetDepotVersion {
+    pub depot_id: u32,
+    pub manifest_id: u64,
+    /// Installed size of the manifest, when Steam lists it.
+    pub size: Option<u64>,
+}
+
+/// The public branch of each of `app_ids`, in one access-token and one
+/// product-info round trip per batch. Apps Steam returns nothing for are
+/// left out.
+pub(crate) async fn app_versions(
+    client: &SteamClient<LoggedIn>,
+    app_ids: &[u32],
+) -> Result<Vec<RplnetAppVersion>, RplnetError> {
+    let started = std::time::Instant::now();
+    let app_ids: Vec<AppId> = app_ids.iter().copied().map(AppId).collect();
+    let tokens: BTreeMap<u32, u64> = futures::stream::iter(batches(&app_ids, TOKENS_PER_REQUEST))
+        .map(|batch| async move { client.pics_get_access_tokens(&batch).await })
+        .buffer_unordered(REQUESTS_IN_FLIGHT)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .map(|token| (token.app_id.0, token.token))
+        .collect();
+    let requests: Vec<AccessToken> = app_ids
+        .iter()
+        .map(|app| AccessToken {
+            app_id: *app,
+            token: tokens.get(&app.0).copied().unwrap_or(0),
+        })
+        .collect();
+    let infos: Vec<AppInfo> = futures::stream::iter(batches(&requests, APPS_PER_REQUEST))
+        .map(|batch| async move { client.pics_get_product_info(&batch).await })
+        .buffer_unordered(REQUESTS_IN_FLIGHT)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+    let versions: Vec<RplnetAppVersion> = infos
+        .iter()
+        .filter_map(|info| {
+            let app_id = info.app_id?;
+            let kv = info.key_values().ok()?;
+            Some(app_version(app_id.0, info.change_number.unwrap_or(0), &kv))
+        })
+        .collect();
+    info!(
+        "app versions: {} of {} apps in {} ms",
+        versions.len(),
+        app_ids.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(versions)
+}
+
+fn app_version(app_id: u32, change_number: u32, kv: &KeyValue) -> RplnetAppVersion {
+    let mut depots: Vec<RplnetDepotVersion> = match kv.get("depots").map(|d| &d.value) {
+        Some(KvValue::Children(depots)) => depots
+            .iter()
+            .filter_map(|(key, depot)| {
+                let depot_id: u32 = key.parse().ok()?;
+                let (manifest_id, size) = public_manifest(depot)?;
+                Some(RplnetDepotVersion {
+                    depot_id,
+                    manifest_id,
+                    size,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    depots.sort_by_key(|depot| depot.depot_id);
+    RplnetAppVersion {
+        app_id,
+        change_number,
+        build_id: public_build_id(kv),
+        build_time: public_build_time(kv),
+        depots,
+    }
+}
+
+fn public_branch(kv: &KeyValue) -> Option<&KeyValue> {
+    kv.get("depots")?.get("branches")?.get("public")
+}
+
+fn public_build_id(kv: &KeyValue) -> Option<u32> {
+    number(public_branch(kv)?.get("buildid")).and_then(|id| u32::try_from(id).ok())
+}
+
+fn public_build_time(kv: &KeyValue) -> Option<i64> {
+    number(public_branch(kv)?.get("timeupdated")).and_then(|time| i64::try_from(time).ok())
+}
+
+/// A depot's public manifest id and size.
+fn public_manifest(depot: &KeyValue) -> Option<(u64, Option<u64>)> {
+    let public = depot.get("manifests").and_then(|m| m.get("public"))?;
+    // Newer PICS nests the id as `public/gid`; older has it as the value.
+    let manifest_id = number(public.get("gid")).or_else(|| number(Some(public)))?;
+    let size = number(public.get("size")).or_else(|| number(depot.get("maxsize")));
+    Some((manifest_id, size))
 }
 
 /// `items` split into owned batches of `size`, so each request future owns
@@ -436,7 +551,10 @@ mod tests {
     fn names_and_images_follow_the_language() {
         let kv = app(vec![children(
             "branches",
-            vec![children("public", vec![s("buildid", "18234567")])],
+            vec![children(
+                "public",
+                vec![s("buildid", "18234567"), s("timeupdated", "1759651200")],
+            )],
         )]);
         let chinese = game(&kv, &[], &[], "schinese");
         assert_eq!(chinese.name, "罗曼圣诞探案集");
@@ -456,6 +574,43 @@ mod tests {
         );
         assert!(english.visual_novel);
         assert_eq!(english.build_id, Some(18234567));
+        assert_eq!(english.build_time, Some(1759651200));
+    }
+
+    #[test]
+    fn app_versions_list_every_public_depot_manifest() {
+        let kv = app(vec![
+            depot("102", vec![s("depotfromapp", "228980")], "12"),
+            depot("101", vec![], "11"),
+            children("103", vec![s("name", "no manifest")]),
+            children(
+                "branches",
+                vec![children(
+                    "public",
+                    vec![s("buildid", "42"), s("timeupdated", "1759651200")],
+                )],
+            ),
+        ]);
+        let version = app_version(100, 9, &kv);
+        assert_eq!(version.build_id, Some(42));
+        assert_eq!(version.build_time, Some(1759651200));
+        assert_eq!(version.change_number, 9);
+        // Ranking does not apply: the app's own depot is looked up by id.
+        assert_eq!(
+            version.depots,
+            vec![
+                RplnetDepotVersion {
+                    depot_id: 101,
+                    manifest_id: 11,
+                    size: Some(1000)
+                },
+                RplnetDepotVersion {
+                    depot_id: 102,
+                    manifest_id: 12,
+                    size: Some(1000)
+                },
+            ]
+        );
     }
 
     #[test]

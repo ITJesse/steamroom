@@ -9,6 +9,7 @@ mod renpy;
 pub mod session;
 pub mod store;
 pub mod token;
+pub mod update;
 
 /// Settings the app supplies for every Steam connection.
 #[derive(Clone, Debug, uniffi::Record)]

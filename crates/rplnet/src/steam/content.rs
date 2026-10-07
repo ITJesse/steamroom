@@ -210,44 +210,27 @@ impl Content {
             };
             let (_, manifest) = self.manifest(client, app_id, candidate, &key).await?;
             read += 1;
-            let entries: Vec<_> = manifest
-                .files
-                .iter()
-                .map(|file| (file.normalized_path(), file))
-                .collect();
-            let listing: Vec<renpy::Entry<'_>> = entries
-                .iter()
-                .map(|(path, file)| renpy::Entry {
-                    path,
-                    size: file.size,
-                    is_dir: file.flags & DIRECTORY_FLAG != 0,
-                })
-                .collect();
             if inspection.depot_id.is_none() {
                 inspection.depot_id = Some(candidate.depot_id);
                 inspection.manifest_id = Some(candidate.manifest_id);
             }
-            let Some(layout) = renpy::detect(&listing) else {
+            let Some(layout) = renpy_layout(&manifest) else {
                 continue;
             };
             inspection.depot_id = Some(candidate.depot_id);
             inspection.manifest_id = Some(candidate.manifest_id);
             let version_files = match version_dir {
                 Some(dir) => {
-                    let wanted = renpy::version_files(&listing, &layout.root);
-                    let files: Vec<&ManifestFile> = entries
-                        .iter()
-                        .filter(|(path, _)| wanted.contains(&path.as_str()))
-                        .map(|(_, file)| *file)
-                        .collect();
-                    let written = self
-                        .write_files(client, app_id, candidate.depot_id, &key, &files, dir)
-                        .await?;
-                    for lib in renpy::lib_directories(&listing, &layout.root) {
-                        let path = dir.join(&layout.root).join("lib").join(lib);
-                        tokio::fs::create_dir_all(&path).await?;
-                    }
-                    written
+                    self.write_version_files(
+                        client,
+                        app_id,
+                        candidate.depot_id,
+                        &key,
+                        &manifest,
+                        &layout.root,
+                        dir,
+                    )
+                    .await?
                 }
                 None => Vec::new(),
             };
@@ -310,21 +293,51 @@ impl Content {
             }
             Err(e) => return Err(e.into()),
         };
-        let mut manifest = steamroom_client::manifest::parse_cdn_manifest(&raw).map_err(|e| {
-            RplnetError::steam(
-                RplnetSteamFailure::InvalidResponse,
-                format!("manifest: {e}"),
-            )
-        })?;
-        if manifest.filenames_encrypted {
-            manifest.decrypt_filenames(key).map_err(|e| {
-                RplnetError::steam(
-                    RplnetSteamFailure::InvalidResponse,
-                    format!("manifest file names: {e}"),
-                )
-            })?;
-        }
+        let manifest = parse_manifest(&raw, key)?;
         Ok((raw, manifest))
+    }
+
+    /// Write the files carrying the engine version of the Ren'Py game at
+    /// `root` into `dir`, at their depot paths, with the `lib/` directories
+    /// the version probe looks at. Returns the paths written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_version_files(
+        &self,
+        client: &SteamClient<LoggedIn>,
+        app_id: u32,
+        depot_id: u32,
+        key: &DepotKey,
+        manifest: &DepotManifest,
+        root: &str,
+        dir: &Path,
+    ) -> Result<Vec<String>, RplnetError> {
+        let entries: Vec<_> = manifest
+            .files
+            .iter()
+            .map(|file| (file.normalized_path(), file))
+            .collect();
+        let listing: Vec<renpy::Entry<'_>> = entries
+            .iter()
+            .map(|(path, file)| renpy::Entry {
+                path,
+                size: file.size,
+                is_dir: file.flags & DIRECTORY_FLAG != 0,
+            })
+            .collect();
+        let wanted = renpy::version_files(&listing, root);
+        let files: Vec<&ManifestFile> = entries
+            .iter()
+            .filter(|(path, _)| wanted.contains(&path.as_str()))
+            .map(|(_, file)| *file)
+            .collect();
+        let written = self
+            .write_files(client, app_id, depot_id, key, &files, dir)
+            .await?;
+        for lib in renpy::lib_directories(&listing, root) {
+            let path = dir.join(root).join("lib").join(lib);
+            tokio::fs::create_dir_all(&path).await?;
+        }
+        Ok(written)
     }
 
     /// Download whole small files into `dir`, at their depot paths. Every
@@ -491,6 +504,45 @@ impl ChunkFetcher for ContentFetcher {
             }
         }
     }
+}
+
+/// A manifest as the CDN sent it, parsed, with its file names decrypted.
+pub(crate) fn parse_manifest(raw: &[u8], key: &DepotKey) -> Result<DepotManifest, RplnetError> {
+    let mut manifest = steamroom_client::manifest::parse_cdn_manifest(raw).map_err(|e| {
+        RplnetError::steam(
+            RplnetSteamFailure::InvalidResponse,
+            format!("manifest: {e}"),
+        )
+    })?;
+    if manifest.filenames_encrypted {
+        manifest.decrypt_filenames(key).map_err(|e| {
+            RplnetError::steam(
+                RplnetSteamFailure::InvalidResponse,
+                format!("manifest file names: {e}"),
+            )
+        })?;
+    }
+    Ok(manifest)
+}
+
+/// The Ren'Py layout of a manifest, or `None` when it holds no Ren'Py game.
+pub(crate) fn renpy_layout(manifest: &DepotManifest) -> Option<renpy::Layout> {
+    let paths: Vec<String> = manifest
+        .files
+        .iter()
+        .map(ManifestFile::normalized_path)
+        .collect();
+    let listing: Vec<renpy::Entry<'_>> = manifest
+        .files
+        .iter()
+        .zip(&paths)
+        .map(|(file, path)| renpy::Entry {
+            path,
+            size: file.size,
+            is_dir: file.flags & DIRECTORY_FLAG != 0,
+        })
+        .collect();
+    renpy::detect(&listing)
 }
 
 /// Content servers as Steam places them for `region`: the first probe

@@ -80,6 +80,9 @@ pub enum RplnetSteamFailure {
     InvalidResponse,
     /// The chosen download region has no content servers right now.
     RegionUnavailable,
+    /// The game's depot no longer holds a Ren'Py game (an update to a build
+    /// that dropped or moved it beyond recognition).
+    NotRenPy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]

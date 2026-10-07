@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Chunks fetched at once, across up to as many files at once.
-const CONCURRENT_CHUNKS: usize = 8;
+pub(super) const CONCURRENT_CHUNKS: usize = 8;
 /// Least time between two progress reports.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -77,7 +77,7 @@ pub trait RplnetDownloadObserver: Send + Sync {
 /// Stops a download (or anything else that takes one) when cancelled.
 #[derive(uniffi::Object, Default)]
 pub struct RplnetCancellation {
-    token: CancellationToken,
+    pub(super) token: CancellationToken,
 }
 
 #[uniffi::export]
@@ -195,7 +195,7 @@ pub(crate) async fn download(
 }
 
 /// `manifest` cut down to the story files below `root` (case-insensitive).
-fn story_files(manifest: &DepotManifest, root: &str) -> DepotManifest {
+pub(super) fn story_files(manifest: &DepotManifest, root: &str) -> DepotManifest {
     let root = root.to_lowercase();
     let mut filtered = manifest.clone();
     filtered.files.retain(|file| {
@@ -207,7 +207,7 @@ fn story_files(manifest: &DepotManifest, root: &str) -> DepotManifest {
 }
 
 /// The regular files of `manifest`.
-fn downloaded_files(manifest: &DepotManifest) -> Vec<RplnetDownloadedFile> {
+pub(super) fn downloaded_files(manifest: &DepotManifest) -> Vec<RplnetDownloadedFile> {
     manifest
         .files
         .iter()
@@ -223,7 +223,7 @@ fn downloaded_files(manifest: &DepotManifest) -> Vec<RplnetDownloadedFile> {
         .collect()
 }
 
-fn is_regular(file: &ManifestFile) -> bool {
+pub(super) fn is_regular(file: &ManifestFile) -> bool {
     let flags = DepotFileFlags::from_bits_retain(file.flags);
     !flags.is_directory() && !flags.is_symlink() && file.link_target.is_none()
 }
@@ -252,7 +252,7 @@ impl ProgressTally {
 }
 
 /// Turn download events into throttled progress reports.
-async fn report_progress(
+pub(super) async fn report_progress(
     mut events: tokio::sync::mpsc::UnboundedReceiver<DownloadEvent>,
     observer: Arc<dyn RplnetDownloadObserver>,
     total: u64,
@@ -271,7 +271,7 @@ async fn report_progress(
     }
 }
 
-fn download_error(error: DownloadError) -> RplnetError {
+pub(super) fn download_error(error: DownloadError) -> RplnetError {
     match error {
         DownloadError::Io(e) => e.into(),
         DownloadError::Fetch { source } => match source.downcast::<steamroom::Error>() {
