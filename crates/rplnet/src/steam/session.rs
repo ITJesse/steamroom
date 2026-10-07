@@ -2,7 +2,13 @@
 
 use super::RplnetConnectOptions;
 use super::RplnetCredential;
+use super::content::Content;
+use super::content::RplnetInspection;
+use super::library;
+use super::library::RplnetDepotCandidate;
+use super::library::RplnetOwnedGame;
 use crate::error::RplnetError;
+use crate::error::RplnetSteamFailure;
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,6 +25,8 @@ use tokio::sync::broadcast;
 use tracing::debug;
 use tracing::info;
 
+/// How long to wait for the license list Steam pushes after logon.
+const LICENSE_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long to wait for the account info Steam pushes after logon.
 const ACCOUNT_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for the answer to a persona request.
@@ -53,6 +61,7 @@ pub struct RplnetSteamSession {
     account_name: String,
     refresh_token: Mutex<String>,
     events: Events,
+    content: Content,
 }
 
 impl RplnetSteamSession {
@@ -68,6 +77,7 @@ impl RplnetSteamSession {
             account_name,
             refresh_token: Mutex::new(refresh_token),
             events,
+            content: Content::default(),
         })
     }
 
@@ -190,6 +200,47 @@ impl RplnetSteamSession {
             persona_name,
             avatar_url,
         })
+    }
+
+    /// The games the account owns, with the depots to inspect for each.
+    /// `language` is a Steam language code (`english`, `schinese`,
+    /// `japanese`, …) for names and store images.
+    pub async fn owned_games(&self, language: String) -> Result<Vec<RplnetOwnedGame>, RplnetError> {
+        let licenses = self
+            .events
+            .first(
+                self.events.subscribe(),
+                EMsg::CLIENT_LICENSE_LIST,
+                LICENSE_LIST_TIMEOUT,
+                |msg| library::decode_licenses(&msg.body).ok(),
+            )
+            .await
+            .ok_or_else(|| {
+                RplnetError::steam(
+                    RplnetSteamFailure::InvalidResponse,
+                    "Steam sent no license list",
+                )
+            })?;
+        library::owned_games(&self.client, &licenses, &language).await
+    }
+
+    /// Read a game's depot manifests (from `owned_games`) to tell whether it
+    /// is Ren'Py. With `version_dir`, a Ren'Py game's engine version files
+    /// are written under that directory at their depot paths.
+    pub async fn inspect(
+        &self,
+        app_id: u32,
+        depots: Vec<RplnetDepotCandidate>,
+        version_dir: Option<String>,
+    ) -> Result<RplnetInspection, RplnetError> {
+        self.content
+            .inspect(
+                &self.client,
+                app_id,
+                &depots,
+                version_dir.as_deref().map(std::path::Path::new),
+            )
+            .await
     }
 
     /// Ask Steam for a new refresh token. Steam only issues one when it

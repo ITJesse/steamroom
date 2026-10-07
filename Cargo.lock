@@ -2779,12 +2779,14 @@ dependencies = [
 
 [[package]]
 name = "rplnet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
+ "futures",
  "prost",
  "reqwest",
  "serde_json",
+ "sha1 0.11.0",
  "steamroom",
  "steamroom-client",
  "thiserror 2.0.18",

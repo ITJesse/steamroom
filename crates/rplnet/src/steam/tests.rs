@@ -602,3 +602,164 @@ async fn polling_reconnects_after_the_cm_closes_the_connection() {
     cm.accept_logon(&token).await;
     assert_eq!(finish.await.unwrap().unwrap().session.steam_id(), STEAM_ID);
 }
+
+/// Answer a job-style request (PICS) with `emsg`.
+fn answer(cm: &Cm, call: &IncomingMsg, emsg: EMsg, body: impl Message) {
+    cm.send(
+        emsg,
+        CMsgProtoBufHeader {
+            jobid_target: call.header.jobid_source,
+            ..Default::default()
+        },
+        body,
+    );
+}
+
+/// A package's PICS buffer: the 4-byte package id, then text KV.
+fn package_buffer(id: u32, apps: &[u32], depots: &[u32]) -> Vec<u8> {
+    let list = |items: &[u32]| {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("\"{i}\" \"{v}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut buffer = id.to_le_bytes().to_vec();
+    buffer.extend(
+        format!(
+            "\"{id}\" {{ \"appids\" {{ {} }} \"depotids\" {{ {} }} }}",
+            list(apps),
+            list(depots)
+        )
+        .into_bytes(),
+    );
+    buffer
+}
+
+#[tokio::test]
+async fn owned_games_come_from_licenses_packages_and_app_info() {
+    let (session, mut cm, _) = resumed_session().await;
+    let me = (STEAM_ID & 0xFFFF_FFFF) as u32;
+    cm.push(
+        EMsg::CLIENT_LICENSE_LIST,
+        generated::CMsgClientLicenseList {
+            eresult: Some(1),
+            licenses: vec![
+                generated::c_msg_client_license_list::License {
+                    package_id: Some(1),
+                    owner_id: Some(me),
+                    access_token: Some(11),
+                    ..Default::default()
+                },
+                generated::c_msg_client_license_list::License {
+                    package_id: Some(2),
+                    owner_id: Some(me + 1),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+    let games = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move { session.owned_games("schinese".to_string()).await }
+    });
+
+    let call = cm.next().await;
+    assert_eq!(call.emsg, EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST);
+    let request = generated::CMsgClientPicsProductInfoRequest::decode(&*call.body).unwrap();
+    let mut tokens: Vec<_> = request
+        .packages
+        .iter()
+        .map(|p| (p.packageid.unwrap(), p.access_token.unwrap()))
+        .collect();
+    tokens.sort();
+    assert_eq!(tokens, vec![(1, 11), (2, 0)]);
+    let package = |id, apps: &[u32], depots: &[u32]| {
+        generated::c_msg_client_pics_product_info_response::PackageInfo {
+            packageid: Some(id),
+            buffer: Some(package_buffer(id, apps, depots)),
+            ..Default::default()
+        }
+    };
+    answer(
+        &cm,
+        &call,
+        EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
+        generated::CMsgClientPicsProductInfoResponse {
+            packages: vec![package(1, &[100, 300], &[101]), package(2, &[200], &[201])],
+            ..Default::default()
+        },
+    );
+
+    let call = cm.next().await;
+    assert_eq!(call.emsg, EMsg::CLIENT_PICS_ACCESS_TOKEN_REQUEST);
+    answer(
+        &cm,
+        &call,
+        EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE,
+        generated::CMsgClientPicsAccessTokenResponse {
+            app_access_tokens: vec![
+                generated::c_msg_client_pics_access_token_response::AppToken {
+                    appid: Some(100),
+                    access_token: Some(77),
+                },
+            ],
+            ..Default::default()
+        },
+    );
+
+    let call = cm.next().await;
+    assert_eq!(call.emsg, EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST);
+    let request = generated::CMsgClientPicsProductInfoRequest::decode(&*call.body).unwrap();
+    let app_100 = request.apps.iter().find(|a| a.appid == Some(100)).unwrap();
+    assert_eq!(app_100.access_token, Some(77));
+    let app = |id: u32, kind: &str, name: &str, depot: u32| {
+        generated::c_msg_client_pics_product_info_response::AppInfo {
+            appid: Some(id),
+            change_number: Some(5),
+            buffer: Some(
+                format!(
+                    "\"{id}\" {{ \"common\" {{ \"type\" \"{kind}\" \"name\" \"{name}\" \
+                     \"name_localized\" {{ \"schinese\" \"中文{name}\" }} \
+                     \"store_tags\" {{ \"0\" \"3799\" }} }} \
+                     \"depots\" {{ \"{depot}\" {{ \"manifests\" {{ \"public\" {{ \"gid\" \"9{depot}\" \"size\" \"10\" }} }} }} }} }}"
+                )
+                .into_bytes(),
+            ),
+            ..Default::default()
+        }
+    };
+    answer(
+        &cm,
+        &call,
+        EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
+        generated::CMsgClientPicsProductInfoResponse {
+            apps: vec![
+                app(100, "Game", "Owned", 101),
+                app(200, "game", "Shared", 201),
+                app(300, "DLC", "Extra", 301),
+            ],
+            ..Default::default()
+        },
+    );
+
+    let mut games = games.await.unwrap().unwrap();
+    games.sort_by_key(|g| g.app_id);
+    assert_eq!(games.len(), 2, "the DLC is not a game");
+    assert_eq!(games[0].app_id, 100);
+    assert_eq!(games[0].name, "中文Owned");
+    assert!(!games[0].family_shared);
+    assert!(games[0].visual_novel);
+    assert_eq!(
+        games[0].depots,
+        vec![super::library::RplnetDepotCandidate {
+            depot_id: 101,
+            manifest_id: 9101,
+            size: Some(10),
+            owned: true,
+        }]
+    );
+    assert_eq!(games[1].app_id, 200);
+    assert!(games[1].family_shared);
+}

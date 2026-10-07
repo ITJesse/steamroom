@@ -2,6 +2,9 @@
 
 pub mod auth;
 mod cm;
+pub mod content;
+pub mod library;
+mod renpy;
 pub mod session;
 pub mod token;
 
