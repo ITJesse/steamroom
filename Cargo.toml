@@ -7,6 +7,8 @@ members = [
     "crates/steamroom-cli",
     "crates/steamroom-ffi",
     "crates/steamroom-proto-extract",
+    "crates/rplnet",
+    "crates/rplnet-bindgen",
 ]
 
 [workspace.dependencies]
@@ -70,3 +72,13 @@ tokio-util = "0.7"
 
 steamroom = { version = "0.4.0", path = "crates/steamroom" }
 steamroom-client = { version = "0.4.0", path = "crates/steamroom-client" }
+
+# Release build of rplnet's iOS static library (crates/rplnet/build-xcframework.zsh).
+# A separate profile so the CLI's `release` stays tuned for speed.
+[profile.rplnet-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+# UniFFI turns panics into errors for the app, which needs unwinding.
+panic = "unwind"

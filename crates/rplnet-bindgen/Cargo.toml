@@ -1,0 +1,14 @@
+[package]
+name = "rplnet-bindgen"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "uniffi-bindgen pinned to rplnet's UniFFI version"
+publish = false
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }

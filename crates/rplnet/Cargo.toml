@@ -1,0 +1,23 @@
+[package]
+name = "rplnet"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "RenPyLinter's Steam layer: a UniFFI surface over steamroom for the iOS app"
+publish = false
+
+[lib]
+# `staticlib` is what the app links (packaged by build-xcframework.zsh);
+# `lib` lets the tests and uniffi-bindgen use the crate.
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+steamroom = { workspace = true }
+steamroom-client = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uniffi = { version = "0.32", features = ["tokio"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
