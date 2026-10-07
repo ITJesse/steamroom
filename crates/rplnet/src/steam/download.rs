@@ -1,8 +1,9 @@
-//! Downloading a Ren'Py game's story files from its depot (plan stage 5,
-//! `renpy::is_story_file`). Files are written at their depot paths under a
-//! directory the app owns; running the same download into the same directory
-//! again resumes it, keeping every file that already matches the manifest and
-//! every chunk of a partly written file that does.
+//! Downloading a Ren'Py game's story files from its depot and the depots of
+//! its owned DLC (plan stage 5, `renpy::is_story_file`). Files are written at
+//! their depot paths under a directory the app owns; running the same
+//! download into the same directory again resumes it, keeping every file that
+//! already matches the manifest and every chunk of a partly written file that
+//! does.
 
 use super::content::Content;
 use super::content::ContentFetcher;
@@ -20,34 +21,47 @@ use steamroom::client::LoggedIn;
 use steamroom::client::SteamClient;
 use steamroom::depot::AppId;
 use steamroom::depot::DepotId;
+use steamroom::depot::DepotKey;
 use steamroom::depot::manifest::DepotManifest;
 use steamroom::depot::manifest::ManifestFile;
 use steamroom::enums::DepotFileFlags;
+use steamroom::error::ConnectionError;
 use steamroom_client::download::DepotJob;
 use steamroom_client::download::DownloadError;
 use steamroom_client::event::DownloadEvent;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use tracing::warn;
 
 /// Chunks fetched at once, across up to as many files at once.
 pub(super) const CONCURRENT_CHUNKS: usize = 8;
 /// Least time between two progress reports.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
-/// One depot's Ren'Py files to download.
+/// A depot to download from, at one manifest.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RplnetDepotDownload {
+    pub depot_id: u32,
+    pub manifest_id: u64,
+    /// Where to keep the manifest as the CDN sent it.
+    pub manifest_file: String,
+}
+
+/// A Ren'Py game's story files to download.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RplnetDownloadRequest {
     pub app_id: u32,
-    pub depot_id: u32,
-    pub manifest_id: u64,
-    /// The Ren'Py root inside the depot, as inspection found it: only the
-    /// story files below it are downloaded.
+    /// The game's depot (the one inspection found the game in) first, then
+    /// the depots of its owned DLC. They install into one directory: where
+    /// two have the same file, the later one's is kept, so a DLC that
+    /// replaces a file of the game gets its way.
+    pub depots: Vec<RplnetDepotDownload>,
+    /// The Ren'Py root inside the game's depot, as inspection found it: only
+    /// the story files below it are downloaded, from every depot.
     pub root: String,
     /// Directory the files are written to, at their depot paths. Running the
     /// same request into it again resumes the download.
     pub destination: String,
-    /// Where to keep the manifest as the CDN sent it.
-    pub manifest_file: String,
 }
 
 /// A downloaded file, as the manifest describes it.
@@ -58,12 +72,17 @@ pub struct RplnetDownloadedFile {
     pub size: u64,
     /// SHA-1 of the content, lowercase hex.
     pub sha1: String,
+    /// The depot it comes from.
+    pub depot_id: u32,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct RplnetDownloadResult {
     pub files: Vec<RplnetDownloadedFile>,
     pub total_size: u64,
+    /// DLC depots Steam refused the key for (the DLC is no longer owned):
+    /// nothing came from them and their manifest was not written.
+    pub skipped_depots: Vec<u32>,
 }
 
 /// Progress of a running download.
@@ -107,80 +126,108 @@ pub(crate) async fn download(
 ) -> Result<RplnetDownloadResult, RplnetError> {
     let work = async {
         let started = Instant::now();
-        let depot = DepotId(request.depot_id);
-        let key = client
-            .get_depot_decryption_key(depot, AppId(request.app_id))
-            .await?;
-        let candidate = RplnetDepotCandidate {
-            depot_id: request.depot_id,
-            manifest_id: request.manifest_id,
-            size: None,
-            owned: true,
-        };
-        let (raw, manifest) = content
-            .manifest(client, request.app_id, &candidate, &key)
-            .await?;
-        let manifest_file = Path::new(&request.manifest_file);
-        if let Some(parent) = manifest_file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let mut layers = Vec::new();
+        let mut skipped_depots = Vec::new();
+        for (index, depot) in request.depots.iter().enumerate() {
+            let Some(key) = depot_key(client, request.app_id, depot.depot_id, index > 0).await?
+            else {
+                skipped_depots.push(depot.depot_id);
+                continue;
+            };
+            let (raw, manifest) = content
+                .manifest(client, request.app_id, &candidate(depot), &key)
+                .await?;
+            save_manifest(&depot.manifest_file, &raw).await?;
+            layers.push(Layer {
+                depot_id: depot.depot_id,
+                key,
+                manifest,
+            });
         }
-        tokio::fs::write(manifest_file, &raw).await?;
-
-        let filtered = story_files(&manifest, &request.root);
-        let files = downloaded_files(&filtered);
-        if files.is_empty() {
+        let Some(game) = layers.first() else {
+            return Err(RplnetError::steam(
+                RplnetSteamFailure::InvalidResponse,
+                "the download names no depot",
+            ));
+        };
+        if downloaded_files(&story_files(&game.manifest, &request.root), game.depot_id).is_empty() {
             return Err(RplnetError::steam(
                 RplnetSteamFailure::InvalidResponse,
                 "the depot has no game files under the Ren'Py root",
             ));
         }
+
+        let filtered = layered_story_files(&layers, &request.root);
+        let files: Vec<RplnetDownloadedFile> = layers
+            .iter()
+            .zip(&filtered)
+            .flat_map(|(layer, manifest)| downloaded_files(manifest, layer.depot_id))
+            .collect();
         let total_size: u64 = files.iter().map(|file| file.size).sum();
         let sizes: HashMap<String, u64> = filtered
-            .files
             .iter()
+            .flat_map(|manifest| &manifest.files)
             .map(|file| (file.filename.clone(), file.size))
             .collect();
 
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let job = DepotJob::builder()
-            .depot_id(depot)
-            .depot_key(key)
-            .install_dir(request.destination.clone().into())
-            .max_downloads(CONCURRENT_CHUNKS)
-            .verify(true)
-            // Write files in place: nothing reads the directory before the
-            // download completes, a resumed download keeps the verified
-            // chunks of an interrupted file, and no staging directory ends up
-            // among the story files.
-            .non_atomic(true)
-            .event_sender(events)
-            .build()
-            .map_err(|e| RplnetError::steam(RplnetSteamFailure::InvalidResponse, e))?;
         let reporter = tokio::spawn(report_progress(
             receiver,
             Arc::clone(&observer),
             total_size,
             sizes,
         ));
-        let fetcher = Arc::new(ContentFetcher {
-            servers: content.servers(client).await?,
-            client: client.clone(),
-            app_id: request.app_id,
-        });
-        let outcome = job.download(&filtered, fetcher).await;
-        drop(job);
+        let servers = content.servers(client).await?;
+        let mut fetched = 0;
+        let mut present = 0;
+        for (layer, manifest) in layers.into_iter().zip(&filtered) {
+            if manifest.files.is_empty() {
+                continue;
+            }
+            let job = DepotJob::builder()
+                .depot_id(DepotId(layer.depot_id))
+                .depot_key(layer.key)
+                .install_dir(request.destination.clone().into())
+                .max_downloads(CONCURRENT_CHUNKS)
+                .verify(true)
+                // Write files in place: nothing reads the directory before the
+                // download completes, a resumed download keeps the verified
+                // chunks of an interrupted file, and no staging directory ends
+                // up among the story files.
+                .non_atomic(true)
+                .event_sender(events.clone())
+                .build()
+                .map_err(|e| RplnetError::steam(RplnetSteamFailure::InvalidResponse, e))?;
+            let fetcher = Arc::new(ContentFetcher {
+                servers: Arc::clone(&servers),
+                client: client.clone(),
+                app_id: request.app_id,
+            });
+            let stats = job
+                .download(manifest, fetcher)
+                .await
+                .map_err(|report| download_error(report.into_current_context()))?;
+            fetched += stats.files_completed;
+            present += stats.files_skipped;
+        }
+        drop(events);
         let _ = reporter.await;
-        let stats = outcome.map_err(|report| download_error(report.into_current_context()))?;
         observer.progress(total_size, total_size);
         info!(
-            "downloaded depot {}: {} files fetched, {} already present, {} bytes in {} s",
-            request.depot_id,
-            stats.files_completed,
-            stats.files_skipped,
+            "downloaded app {} from {} depots ({} skipped): {} files fetched, {} already present, {} bytes in {} s",
+            request.app_id,
+            filtered.len(),
+            skipped_depots.len(),
+            fetched,
+            present,
             total_size,
             started.elapsed().as_secs()
         );
-        Ok(RplnetDownloadResult { files, total_size })
+        Ok(RplnetDownloadResult {
+            files,
+            total_size,
+            skipped_depots,
+        })
     };
     let outcome = tokio::select! {
         biased;
@@ -192,6 +239,52 @@ pub(crate) async fn download(
         content.invalidate().await;
     }
     outcome
+}
+
+/// A depot's manifest, with the key that decrypts its chunks.
+pub(super) struct Layer {
+    pub(super) depot_id: u32,
+    pub(super) key: DepotKey,
+    pub(super) manifest: DepotManifest,
+}
+
+pub(super) fn candidate(depot: &RplnetDepotDownload) -> RplnetDepotCandidate {
+    RplnetDepotCandidate {
+        depot_id: depot.depot_id,
+        manifest_id: depot.manifest_id,
+        size: None,
+        owned: true,
+    }
+}
+
+/// The key of `depot_id`. When `optional` (a DLC depot), Steam refusing it
+/// is `None`: the account no longer owns the DLC.
+pub(super) async fn depot_key(
+    client: &SteamClient<LoggedIn>,
+    app_id: u32,
+    depot_id: u32,
+    optional: bool,
+) -> Result<Option<DepotKey>, RplnetError> {
+    match client
+        .get_depot_decryption_key(DepotId(depot_id), AppId(app_id))
+        .await
+    {
+        Ok(key) => Ok(Some(key)),
+        Err(steamroom::Error::Connection(ConnectionError::DepotAccessDenied(_))) if optional => {
+            warn!("Steam refused the key of DLC depot {depot_id}; it is left out");
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(super) async fn save_manifest(path: &str, raw: &[u8]) -> Result<(), RplnetError> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, raw).await?;
+    Ok(())
 }
 
 /// `manifest` cut down to the story files below `root` (case-insensitive).
@@ -206,8 +299,37 @@ pub(super) fn story_files(manifest: &DepotManifest, root: &str) -> DepotManifest
     filtered
 }
 
-/// The regular files of `manifest`.
-pub(super) fn downloaded_files(manifest: &DepotManifest) -> Vec<RplnetDownloadedFile> {
+/// The story files below `root` of depots installed in the order of
+/// `layers`, one manifest per layer: a path several have (compared
+/// case-insensitively) is kept in the last one only.
+pub(super) fn layered_story_files(layers: &[Layer], root: &str) -> Vec<DepotManifest> {
+    let filtered: Vec<DepotManifest> = layers
+        .iter()
+        .map(|layer| story_files(&layer.manifest, root))
+        .collect();
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    for (index, manifest) in filtered.iter().enumerate() {
+        for file in &manifest.files {
+            owner.insert(file.normalized_path().to_lowercase(), index);
+        }
+    }
+    filtered
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut manifest)| {
+            manifest
+                .files
+                .retain(|file| owner.get(&file.normalized_path().to_lowercase()) == Some(&index));
+            manifest
+        })
+        .collect()
+}
+
+/// The regular files of `manifest`, which is `depot_id`'s.
+pub(super) fn downloaded_files(
+    manifest: &DepotManifest,
+    depot_id: u32,
+) -> Vec<RplnetDownloadedFile> {
     manifest
         .files
         .iter()
@@ -219,6 +341,7 @@ pub(super) fn downloaded_files(manifest: &DepotManifest) -> Vec<RplnetDownloaded
                 .content_sha1()
                 .map(|sha| sha.iter().map(|byte| format!("{byte:02x}")).collect())
                 .unwrap_or_default(),
+            depot_id,
         })
         .collect()
 }
@@ -321,10 +444,68 @@ mod tests {
             ]
         );
 
-        let files = downloaded_files(&filtered);
+        let files = downloaded_files(&filtered, 7);
         assert_eq!(files.len(), 3, "directories are not files");
         assert_eq!(files[0].path, "G/Game/script.rpa");
         assert_eq!(files[0].sha1, "ab".repeat(20));
+        assert_eq!(files[0].depot_id, 7);
+    }
+
+    fn layer(depot_id: u32, files: Vec<ManifestFile>) -> Layer {
+        Layer {
+            depot_id,
+            key: DepotKey([0; 32]),
+            manifest: DepotManifest::new(files),
+        }
+    }
+
+    #[test]
+    fn a_later_depot_replaces_the_files_it_shares() {
+        let layers = vec![
+            layer(
+                1,
+                vec![
+                    file("G\\game\\script.rpa", 10),
+                    file("G\\game\\patch.rpy", 1),
+                    file("G\\renpy\\__init__.py", 5),
+                ],
+            ),
+            // The DLC replaces the patch (in another case) and adds a file;
+            // its soundtrack is outside the root.
+            layer(
+                2,
+                vec![
+                    file("G\\Game\\Patch.rpy", 2),
+                    file("G\\game\\dlc.rpa", 20),
+                    file("Soundtrack\\01.mp3", 30),
+                ],
+            ),
+            // Another platform's copy of the DLC: nothing below the root.
+            layer(
+                3,
+                vec![file(
+                    "G.app\\Contents\\Resources\\autorun\\game\\dlc.rpa",
+                    20,
+                )],
+            ),
+        ];
+        let layered = layered_story_files(&layers, "G/");
+        let paths = |manifest: &DepotManifest| {
+            manifest
+                .files
+                .iter()
+                .map(ManifestFile::normalized_path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&layered[0]),
+            vec!["G/game/script.rpa", "G/renpy/__init__.py"]
+        );
+        assert_eq!(
+            paths(&layered[1]),
+            vec!["G/Game/Patch.rpy", "G/game/dlc.rpa"]
+        );
+        assert!(layered[2].files.is_empty());
     }
 
     #[test]

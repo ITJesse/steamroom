@@ -26,7 +26,9 @@ use steamroom::client::IncomingMsg;
 use steamroom::client::LoggedIn;
 use steamroom::client::Ready;
 use steamroom::client::SteamClient;
+use steamroom::error::ConnectionError;
 use steamroom::generated;
+use steamroom::generated::c_msg_client_license_list::License;
 use steamroom::messages::EMsg;
 use steamroom_client::login::PreparedLoginBuilder;
 use tokio::sync::broadcast;
@@ -55,6 +57,14 @@ pub struct RplnetProfile {
     /// Full-size avatar; `None` when Steam did not send the hash in time or
     /// the account uses no avatar.
     pub avatar_url: Option<String>,
+}
+
+/// Told when a session's connection closes.
+#[uniffi::export(with_foreign)]
+pub trait RplnetConnectionObserver: Send + Sync {
+    /// The CM closed the connection or it failed: every request on the
+    /// session fails from now on. Called once, from a background thread.
+    fn disconnected(&self);
 }
 
 /// A logged-in connection. Releasing it closes the connection.
@@ -102,6 +112,29 @@ impl RplnetSteamSession {
             .login()
             .await?;
         Ok(Self::new(client, account_name, refresh_token))
+    }
+
+    /// The account's licenses: the list Steam pushed last (after logon, and
+    /// again whenever the account gains or loses one).
+    async fn licenses(&self) -> Result<Vec<License>, RplnetError> {
+        self.events
+            .first(
+                self.events.subscribe(),
+                EMsg::CLIENT_LICENSE_LIST,
+                LICENSE_LIST_TIMEOUT,
+                |msg| library::decode_licenses(&msg.body).ok(),
+            )
+            .await
+            .ok_or_else(|| {
+                if self.is_connected() {
+                    RplnetError::steam(
+                        RplnetSteamFailure::InvalidResponse,
+                        "Steam sent no license list",
+                    )
+                } else {
+                    steamroom::Error::from(ConnectionError::Disconnected).into()
+                }
+            })
     }
 
     fn refresh_token(&self) -> String {
@@ -214,22 +247,15 @@ impl RplnetSteamSession {
     /// `language` is a Steam language code (`english`, `schinese`,
     /// `japanese`, …) for names and store images.
     pub async fn owned_games(&self, language: String) -> Result<Vec<RplnetOwnedGame>, RplnetError> {
-        let licenses = self
-            .events
-            .first(
-                self.events.subscribe(),
-                EMsg::CLIENT_LICENSE_LIST,
-                LICENSE_LIST_TIMEOUT,
-                |msg| library::decode_licenses(&msg.body).ok(),
-            )
-            .await
-            .ok_or_else(|| {
-                RplnetError::steam(
-                    RplnetSteamFailure::InvalidResponse,
-                    "Steam sent no license list",
-                )
-            })?;
+        let licenses = self.licenses().await?;
         library::owned_games(&self.client, &licenses, &language).await
+    }
+
+    /// Call `observer` once the CM closes the connection (right away when it
+    /// already has). Replaces an earlier observer. Not called once the
+    /// session is released.
+    pub fn observe_connection(&self, observer: Arc<dyn RplnetConnectionObserver>) {
+        self.events.observe_close(observer);
     }
 
     /// Read a game's depot manifests (from `owned_games`) to tell whether it
@@ -277,14 +303,17 @@ impl RplnetSteamSession {
         .await
     }
 
-    /// What Steam lists now for the public branch of each of `app_ids`, for
-    /// telling whether imported stories are behind. Apps Steam returns
-    /// nothing for are left out.
+    /// What Steam lists now for the public branch of each of `app_ids`, with
+    /// the DLC of each the account owns now, for telling whether imported
+    /// stories are behind. Apps Steam returns nothing for are left out.
+    /// `language` is a Steam language code for DLC names.
     pub async fn app_versions(
         &self,
         app_ids: Vec<u32>,
+        language: String,
     ) -> Result<Vec<RplnetAppVersion>, RplnetError> {
-        library::app_versions(&self.client, &app_ids).await
+        let licenses = self.licenses().await?;
+        library::app_versions(&self.client, &licenses, &app_ids, &language).await
     }
 
     /// Fetch the manifest an update goes to and work out what it changes;
@@ -368,7 +397,15 @@ fn avatar_url(hash: &[u8]) -> Option<String> {
 struct Events {
     latest: Arc<Mutex<HashMap<EMsg, IncomingMsg>>>,
     sender: broadcast::Sender<IncomingMsg>,
+    close: Arc<Mutex<Close>>,
     pump: tokio::task::JoinHandle<()>,
+}
+
+/// Whether the connection has closed, and who to tell when it does.
+#[derive(Default)]
+struct Close {
+    closed: bool,
+    observer: Option<Arc<dyn RplnetConnectionObserver>>,
 }
 
 /// Room for messages a slow subscriber has not read yet; older ones are
@@ -379,10 +416,12 @@ impl Events {
     fn start(client: &SteamClient<LoggedIn>) -> Self {
         let latest = Arc::new(Mutex::new(HashMap::new()));
         let (sender, _) = broadcast::channel(SUBSCRIBER_BUFFER);
+        let close = Arc::new(Mutex::new(Close::default()));
         let incoming = client.events();
         let pump = tokio::spawn({
             let latest = Arc::clone(&latest);
             let sender = sender.clone();
+            let close = Arc::clone(&close);
             async move {
                 while let Ok(msg) = incoming.recv().await {
                     latest
@@ -391,12 +430,39 @@ impl Events {
                         .insert(msg.emsg, msg.clone());
                     let _ = sender.send(msg);
                 }
+                // The event channel closes with the connection, once what it
+                // buffered has been read.
+                info!("Steam connection closed");
+                let observer = {
+                    let mut close = close.lock().unwrap_or_else(|e| e.into_inner());
+                    close.closed = true;
+                    close.observer.take()
+                };
+                if let Some(observer) = observer {
+                    observer.disconnected();
+                }
             }
         });
         Self {
             latest,
             sender,
+            close,
             pump,
+        }
+    }
+
+    fn observe_close(&self, observer: Arc<dyn RplnetConnectionObserver>) {
+        let closed = {
+            let mut close = self.close.lock().unwrap_or_else(|e| e.into_inner());
+            if close.closed {
+                true
+            } else {
+                close.observer = Some(Arc::clone(&observer));
+                false
+            }
+        };
+        if closed {
+            observer.disconnected();
         }
     }
 

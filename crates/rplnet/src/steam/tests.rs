@@ -603,6 +603,41 @@ async fn polling_reconnects_after_the_cm_closes_the_connection() {
     assert_eq!(finish.await.unwrap().unwrap().session.steam_id(), STEAM_ID);
 }
 
+/// Counts `disconnected` calls.
+#[derive(Default)]
+struct CloseCounter {
+    count: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl super::session::RplnetConnectionObserver for CloseCounter {
+    fn disconnected(&self) {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn the_observer_hears_when_the_cm_closes_the_connection() {
+    let (session, mut cm, _) = resumed_session().await;
+    let observer = Arc::new(CloseCounter::default());
+    session.observe_connection(observer.clone());
+    assert!(session.is_connected());
+    assert_eq!(observer.count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    cm.peer.close();
+    tokio::time::timeout(Duration::from_secs(5), observer.notify.notified())
+        .await
+        .expect("not told of the close");
+    assert!(!session.is_connected());
+
+    // Observing a closed session is told at once.
+    let late = Arc::new(CloseCounter::default());
+    session.observe_connection(late.clone());
+    assert_eq!(late.count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(observer.count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// Answer a job-style request (PICS) with `emsg`.
 fn answer(cm: &Cm, call: &IncomingMsg, emsg: EMsg, body: impl Message) {
     cm.send(
@@ -715,6 +750,12 @@ async fn owned_games_come_from_licenses_packages_and_app_info() {
     let app_100 = request.apps.iter().find(|a| a.appid == Some(100)).unwrap();
     assert_eq!(app_100.access_token, Some(77));
     let app = |id: u32, kind: &str, name: &str, depot: u32| {
+        // Game 100 also lists the depot of its DLC 300.
+        let dlc_depot = if id == 100 {
+            "\"302\" { \"dlcappid\" \"300\" \"manifests\" { \"public\" { \"gid\" \"9302\" \"size\" \"20\" } } }"
+        } else {
+            ""
+        };
         generated::c_msg_client_pics_product_info_response::AppInfo {
             appid: Some(id),
             change_number: Some(5),
@@ -723,7 +764,7 @@ async fn owned_games_come_from_licenses_packages_and_app_info() {
                     "\"{id}\" {{ \"common\" {{ \"type\" \"{kind}\" \"name\" \"{name}\" \
                      \"name_localized\" {{ \"schinese\" \"中文{name}\" }} \
                      \"store_tags\" {{ \"0\" \"3799\" }} }} \
-                     \"depots\" {{ \"{depot}\" {{ \"manifests\" {{ \"public\" {{ \"gid\" \"9{depot}\" \"size\" \"10\" }} }} }} }} }}"
+                     \"depots\" {{ \"{depot}\" {{ \"manifests\" {{ \"public\" {{ \"gid\" \"9{depot}\" \"size\" \"10\" }} }} }} {dlc_depot} }} }}"
                 )
                 .into_bytes(),
             ),
@@ -758,6 +799,18 @@ async fn owned_games_come_from_licenses_packages_and_app_info() {
             manifest_id: 9101,
             size: Some(10),
             owned: true,
+        }]
+    );
+    assert_eq!(
+        games[0].dlc,
+        vec![super::library::RplnetDlc {
+            app_id: 300,
+            name: "中文Extra".to_string(),
+            depots: vec![super::library::RplnetDepotVersion {
+                depot_id: 302,
+                manifest_id: 9302,
+                size: Some(20),
+            }],
         }]
     );
     assert_eq!(games[1].app_id, 200);
