@@ -78,9 +78,13 @@ fn multi(packets: &[Vec<u8>], gzip: bool) -> Vec<u8> {
 }
 
 fn logon_response() -> Vec<u8> {
+    logon_response_with_heartbeat(None)
+}
+
+fn logon_response_with_heartbeat(heartbeat_seconds: Option<i32>) -> Vec<u8> {
     let body = generated::CMsgClientLogonResponse {
         eresult: Some(1),
-        heartbeat_seconds: Some(9),
+        heartbeat_seconds,
         ..Default::default()
     }
     .encode_to_vec();
@@ -442,4 +446,31 @@ async fn package_info_sends_the_access_tokens() {
         &body,
     ));
     request.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeats_follow_the_logon_interval() {
+    let (client, mut server) = ready_client().await;
+    let login = tokio::spawn(client.login(ClientMsg::new(EMsg::CLIENT_LOGON)));
+    assert_eq!(server.next_sent().await.emsg, EMsg::CLIENT_LOGON);
+    server.push(logon_response_with_heartbeat(Some(2)));
+    let (client, _) = login.await.unwrap().unwrap();
+
+    let started = tokio::time::Instant::now();
+    for beat in 1..=3u32 {
+        let sent = server.next_sent().await;
+        assert_eq!(sent.emsg, EMsg::CLIENT_HEART_BEAT);
+        assert_eq!(sent.header.steamid, Some(76561197960287930));
+        assert_eq!(sent.header.client_sessionid, Some(42));
+        assert_eq!(started.elapsed(), Duration::from_secs(2) * beat);
+    }
+
+    // No heartbeats once the client is gone.
+    drop(client);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), server.peer.recv())
+            .await
+            .expect("client transport still alive")
+            .is_none()
+    );
 }

@@ -141,6 +141,33 @@ impl ClientInner {
         self.tasks.push(task.abort_handle());
     }
 
+    /// Send `CMsgClientHeartBeat` every `interval` until the connection
+    /// closes. A CM drops a session that stays silent for longer than the
+    /// interval it announced at logon, which a long download easily does.
+    fn start_heartbeat(&self, interval: std::time::Duration) {
+        let channel = Arc::clone(&self.channel);
+        let dispatcher = Arc::clone(&self.dispatcher);
+        let mut msg = ClientMsg::new(EMsg::CLIENT_HEART_BEAT);
+        msg.header.steamid = Some(self.steam_id.load(Ordering::Relaxed));
+        msg.header.client_sessionid = Some(self.session_id.load(Ordering::Relaxed));
+        let packet = msg.to_bytes();
+        let task = tokio::spawn(async move {
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            loop {
+                ticks.tick().await;
+                if dispatcher.is_closed() {
+                    return;
+                }
+                if let Err(e) = channel.send(&packet).await {
+                    debug!(error = %e, "heartbeat send failed; stopping heartbeats");
+                    return;
+                }
+            }
+        });
+        self.tasks.push(task.abort_handle());
+    }
+
     async fn send_raw(&self, msg: &ClientMsg<'_>) -> Result<(), Error> {
         if self.dispatcher.is_closed() {
             return Err(ConnectionError::Disconnected.into());
@@ -386,6 +413,11 @@ impl SteamClient<Ready> {
             "logged in, steamid={}",
             self.inner.steam_id.load(Ordering::Relaxed)
         );
+
+        match heartbeat_interval(&resp) {
+            Some(interval) => self.inner.start_heartbeat(interval),
+            None => debug!("logon response has no heartbeat interval; not sending heartbeats"),
+        }
 
         Ok((
             SteamClient {
@@ -937,6 +969,18 @@ fn parse_incoming(data: &[u8]) -> Result<IncomingMsg, Error> {
             body,
         }),
     }
+}
+
+fn heartbeat_interval(resp: &generated::CMsgClientLogonResponse) -> Option<std::time::Duration> {
+    // Current CMs fill `heartbeat_seconds`; older ones only the legacy field.
+    [
+        resp.heartbeat_seconds,
+        resp.legacy_out_of_game_heartbeat_seconds,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|&secs| secs > 0)
+    .map(|secs| std::time::Duration::from_secs(secs as u64))
 }
 
 fn check_service_eresult(msg: &IncomingMsg) -> Result<(), Error> {
