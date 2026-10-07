@@ -23,6 +23,9 @@ use crate::auth::GuardType;
 use crate::auth::PollInterval;
 use crate::auth::QrAuthSession;
 use crate::cdn::CdnServer;
+use crate::cdn::ContentServer;
+use crate::cdn::ContentServerLocation;
+use crate::cdn::HttpsSupport;
 use crate::content::CdnAuthToken;
 use crate::depot::AppId;
 use crate::depot::CellId;
@@ -837,14 +840,21 @@ impl SteamClient<LoggedIn> {
         Ok(resp.depot_section)
     }
 
-    pub async fn get_cdn_servers(
+    /// Content servers from Steam's directory, with every field it reports.
+    pub async fn get_content_servers(
         &self,
-        cell_id: CellId,
+        location: ContentServerLocation,
         max_servers: Option<u32>,
-    ) -> Result<Vec<CdnServer>, Error> {
+    ) -> Result<Vec<ContentServer>, Error> {
+        let (cell_id, ip_override) = match location {
+            ContentServerLocation::Automatic => (None, None),
+            ContentServerLocation::Cell(cell) => (Some(cell.0), None),
+            ContentServerLocation::IpOverride(ip) => (None, Some(ip.to_string())),
+        };
         let req = generated::CContentServerDirectoryGetServersForSteamPipeRequest {
-            cell_id: Some(cell_id.0),
+            cell_id,
             max_servers,
+            ip_override,
             ..Default::default()
         };
         let resp = self
@@ -856,24 +866,36 @@ impl SteamClient<LoggedIn> {
         let r: generated::CContentServerDirectoryGetServersForSteamPipeResponse = resp.decode()?;
         Ok(r.servers
             .iter()
-            .filter_map(|s| {
-                let host_str = s.host.as_deref()?;
-                let https = s.https_support.as_deref() == Some("mandatory")
-                    || s.https_support.as_deref() == Some("optional");
-                let (host, port) = if let Some((h, p)) = host_str.rsplit_once(':') {
-                    (
-                        h.to_string(),
-                        p.parse().unwrap_or(if https { 443 } else { 80 }),
-                    )
-                } else {
-                    (host_str.to_string(), if https { 443 } else { 80 })
-                };
-                Some(CdnServer {
-                    host,
-                    port,
-                    https,
-                    vhost: s.vhost.clone().unwrap_or_default(),
-                })
+            .filter_map(|info| {
+                let server = ContentServer::from_proto(info);
+                if server.is_none() {
+                    debug!(host = ?info.host, "content server entry without a usable host skipped");
+                }
+                server
+            })
+            .collect())
+    }
+
+    /// Content servers near `cell_id` as download targets, HTTPS where the
+    /// server supports it. See [`get_content_servers`] for the full entries
+    /// and other placements.
+    ///
+    /// [`get_content_servers`]: SteamClient::get_content_servers
+    pub async fn get_cdn_servers(
+        &self,
+        cell_id: CellId,
+        max_servers: Option<u32>,
+    ) -> Result<Vec<CdnServer>, Error> {
+        Ok(self
+            .get_content_servers(ContentServerLocation::Cell(cell_id), max_servers)
+            .await?
+            .iter()
+            .map(|server| {
+                let https = server
+                    .https_support
+                    .as_ref()
+                    .is_some_and(HttpsSupport::allows_https);
+                server.to_cdn_server(https)
             })
             .collect())
     }

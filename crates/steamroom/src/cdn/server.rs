@@ -9,6 +9,17 @@ pub struct CdnServer {
 }
 
 impl CdnServer {
+    /// `vhost` is sent as the Host header when the request goes through a
+    /// lancache; Steam's directory reports it per server.
+    pub fn new(host: String, port: u16, https: bool, vhost: String) -> Self {
+        Self {
+            host,
+            port,
+            https,
+            vhost,
+        }
+    }
+
     pub fn build_url(&self, path: &str, cdn_auth_token: Option<&str>) -> String {
         let scheme = if self.https { "https" } else { "http" };
         let base = format!("{scheme}://{}:{}{path}", self.host, self.port);

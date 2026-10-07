@@ -1,3 +1,5 @@
+/// Content server directory entries and placement.
+pub mod directory;
 /// Lancache detection and URL rewriting for local CDN caches.
 pub mod lancache;
 /// Lock-free CDN server pool with health tracking and round-robin selection.
@@ -5,6 +7,9 @@ pub mod pool;
 /// CDN server address representation.
 pub mod server;
 
+pub use self::directory::ContentServer;
+pub use self::directory::ContentServerLocation;
+pub use self::directory::HttpsSupport;
 pub use self::pool::CdnServerPool;
 pub use self::server::CdnServer;
 use crate::depot::ChunkId;
@@ -23,12 +28,17 @@ pub struct CdnClient {
 
 impl CdnClient {
     pub fn new() -> Result<Self, Error> {
-        crate::tls::ensure_crypto_provider();
-        let client = reqwest::Client::builder().build().map_err(Error::Http)?;
-        Ok(Self {
+        Ok(Self::with_client(crate::http::client()?))
+    }
+
+    /// Use `client` for every CDN request, e.g. to share an application's
+    /// connection pool and timeouts. Build it after
+    /// [`ensure_crypto_provider`](crate::tls::ensure_crypto_provider).
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self {
             client,
             lancache_ip: None,
-        })
+        }
     }
 
     pub fn with_lancache(mut self) -> Self {

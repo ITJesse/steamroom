@@ -1,4 +1,5 @@
 use super::*;
+use crate::cdn::ContentServerLocation;
 use crate::generated::CMsgProtoBufHeader;
 use crate::transport::memory::MemoryPeer;
 use crate::transport::memory::MemoryTransport;
@@ -473,4 +474,57 @@ async fn heartbeats_follow_the_logon_interval() {
             .expect("client transport still alive")
             .is_none()
     );
+}
+
+async fn content_server_request(
+    location: ContentServerLocation,
+) -> generated::CContentServerDirectoryGetServersForSteamPipeRequest {
+    let (client, mut server) = logged_in_client().await;
+    let request = tokio::spawn({
+        let client = client.clone();
+        async move { client.get_content_servers(location, Some(20)).await }
+    });
+    let data = tokio::time::timeout(Duration::from_secs(5), server.peer.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let sent = IncomingMsg::parse(&data).unwrap();
+    let body = generated::CContentServerDirectoryGetServersForSteamPipeResponse {
+        servers: vec![generated::CContentServerDirectoryServerInfo {
+            r#type: Some("CDN".into()),
+            host: Some("cache1-hkg1.steamcontent.com".into()),
+            https_support: Some("optional".into()),
+            weighted_load: Some(12.5),
+            ..Default::default()
+        }],
+        no_change: None,
+    }
+    .encode_to_vec();
+    server.push(response_to(
+        sent.header.jobid_source,
+        EMsg::SERVICE_METHOD_RESPONSE,
+        &body,
+    ));
+    let servers = request.await.unwrap().unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].weighted_load, Some(12.5));
+    generated::CContentServerDirectoryGetServersForSteamPipeRequest::decode(&*sent.body).unwrap()
+}
+
+#[tokio::test]
+async fn ip_override_is_sent_without_a_cell_id() {
+    let req = content_server_request(ContentServerLocation::IpOverride(
+        "203.80.96.10".parse().unwrap(),
+    ))
+    .await;
+    assert_eq!(req.ip_override.as_deref(), Some("203.80.96.10"));
+    assert_eq!(req.cell_id, None);
+    assert_eq!(req.max_servers, Some(20));
+}
+
+#[tokio::test]
+async fn automatic_placement_sends_neither_cell_nor_override() {
+    let req = content_server_request(ContentServerLocation::Automatic).await;
+    assert_eq!(req.ip_override, None);
+    assert_eq!(req.cell_id, None);
 }
