@@ -3,7 +3,12 @@
 use super::RplnetConnectOptions;
 use super::RplnetCredential;
 use super::content::Content;
+use super::content::RplnetContentRegion;
 use super::content::RplnetInspection;
+use super::download::RplnetCancellation;
+use super::download::RplnetDownloadObserver;
+use super::download::RplnetDownloadRequest;
+use super::download::RplnetDownloadResult;
 use super::library;
 use super::library::RplnetDepotCandidate;
 use super::library::RplnetOwnedGame;
@@ -241,6 +246,32 @@ impl RplnetSteamSession {
                 version_dir.as_deref().map(std::path::Path::new),
             )
             .await
+    }
+
+    /// Take content servers from `region` from now on (`None`: let Steam
+    /// pick, the default). Inspections and downloads both follow it.
+    pub fn set_content_region(&self, region: Option<RplnetContentRegion>) {
+        self.content.set_region(region);
+    }
+
+    /// Download a Ren'Py game's story files; see
+    /// [`RplnetDownloadRequest`]. Fails with `Cancelled` once `cancellation`
+    /// fires, and with `RegionUnavailable` when the chosen region has no
+    /// content servers.
+    pub async fn download(
+        &self,
+        request: RplnetDownloadRequest,
+        observer: Arc<dyn RplnetDownloadObserver>,
+        cancellation: Arc<RplnetCancellation>,
+    ) -> Result<RplnetDownloadResult, RplnetError> {
+        super::download::download(
+            &self.content,
+            &self.client,
+            &request,
+            observer,
+            &cancellation,
+        )
+        .await
     }
 
     /// Ask Steam for a new refresh token. Steam only issues one when it

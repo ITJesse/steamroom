@@ -3,9 +3,11 @@
 pub mod auth;
 mod cm;
 pub mod content;
+pub mod download;
 pub mod library;
 mod renpy;
 pub mod session;
+pub mod store;
 pub mod token;
 
 /// Settings the app supplies for every Steam connection.

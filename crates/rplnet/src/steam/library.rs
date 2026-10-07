@@ -38,6 +38,8 @@ pub struct RplnetOwnedGame {
     pub name: String,
     /// PICS change number: changes whenever the app's info changes.
     pub change_number: u32,
+    /// Build of the public branch, when Steam lists it.
+    pub build_id: Option<u32>,
     /// Every license for it belongs to another account (Steam Family); its
     /// content cannot be downloaded with this account.
     pub family_shared: bool,
@@ -209,6 +211,12 @@ fn game_from(
         app_id,
         name,
         change_number,
+        build_id: kv
+            .get("depots")
+            .and_then(|depots| depots.get("branches"))
+            .and_then(|branches| branches.get("public"))
+            .and_then(|public| number(public.get("buildid")))
+            .and_then(|id| u32::try_from(id).ok()),
         family_shared: !packages.is_empty()
             && packages
                 .iter()
@@ -426,7 +434,10 @@ mod tests {
 
     #[test]
     fn names_and_images_follow_the_language() {
-        let kv = app(vec![]);
+        let kv = app(vec![children(
+            "branches",
+            vec![children("public", vec![s("buildid", "18234567")])],
+        )]);
         let chinese = game(&kv, &[], &[], "schinese");
         assert_eq!(chinese.name, "罗曼圣诞探案集");
         assert_eq!(
@@ -444,6 +455,7 @@ mod tests {
                 .ends_with("/100/header.jpg")
         );
         assert!(english.visual_novel);
+        assert_eq!(english.build_id, Some(18234567));
     }
 
     #[test]

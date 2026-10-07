@@ -78,6 +78,8 @@ pub enum RplnetSteamFailure {
     ServiceError { eresult: String },
     /// A response did not have the expected shape.
     InvalidResponse,
+    /// The chosen download region has no content servers right now.
+    RegionUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]

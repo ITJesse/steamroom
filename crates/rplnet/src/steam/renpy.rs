@@ -7,19 +7,61 @@
 //! `*.app/Contents/Resources/autorun/`. Engine copies under `lib/` have no
 //! `game/` next to them and so never qualify. Paths compare case-insensitively;
 //! the root keeps the depot's own case for downloading.
+//!
+//! A story is everything under the root except what only a desktop needs to
+//! start the game (plan 6.5): engine runtimes under `lib/`, Mac bundles,
+//! launchers and native libraries. Games read other files beside `game/`
+//! through `config.basedir` (Doki Doki Literature Club keeps `characters/`
+//! there), and an archive import keeps them too.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// Version of the rules below. Raise it whenever a change could alter a
-/// verdict, so the app re-inspects games it inspected under older rules.
-pub(crate) const RULES_VERSION: u32 = 1;
+/// verdict or the files counted for a story, so the app re-inspects games it
+/// inspected under older rules.
+pub(crate) const RULES_VERSION: u32 = 2;
+
+/// Version of `is_story_file`. Stories record it, so an update can tell
+/// which files an older rule left out.
+pub(crate) const FILTER_VERSION: u32 = 2;
 
 /// Version of the Ren'Py detection rules; inspections made under another
 /// version are stale.
 #[uniffi::export]
 pub fn rplnet_detection_rules_version() -> u32 {
     RULES_VERSION
+}
+
+/// Version of the rule choosing a story's files under the Ren'Py root.
+#[uniffi::export]
+pub fn rplnet_file_filter_version() -> u32 {
+    FILTER_VERSION
+}
+
+/// Native code and launchers for a desktop platform.
+const PLATFORM_EXTENSIONS: [&str; 8] = ["exe", "dll", "so", "dylib", "pdb", "sh", "bat", "command"];
+
+/// Whether a path below the Ren'Py root (lowercase, without the root) belongs
+/// to the story. `game/` and `renpy/` always do; elsewhere `lib/`, `*.app/`,
+/// native libraries and launchers do not, nor does the launcher script
+/// (`<name>.py`) beside the root.
+pub(crate) fn is_story_file(rest: &str) -> bool {
+    let (top, below) = rest.split_once('/').unwrap_or((rest, ""));
+    if top == "game" || top == "renpy" {
+        return true;
+    }
+    if top == "lib" || top.ends_with(".app") {
+        return false;
+    }
+    let name = rest.rsplit('/').next().unwrap_or(rest);
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return true;
+    };
+    if PLATFORM_EXTENSIONS.contains(&extension) {
+        return false;
+    }
+    !(below.is_empty() && extension == "py")
 }
 
 /// One manifest entry, as far as detection needs it.
@@ -35,7 +77,7 @@ pub(crate) struct Layout {
     /// Directory holding `game/` and `renpy/`, relative to the depot root in
     /// the depot's case: empty, or ending in `/`.
     pub root: String,
-    /// Files under `game/` and `renpy/` of the root.
+    /// Files of the story under the root (`is_story_file`).
     pub file_count: u64,
     pub total_size: u64,
     /// Supporting signs (`lib/py3-…`, an exe with a same-named `.py`); logged,
@@ -108,7 +150,7 @@ pub(crate) fn detect(entries: &[Entry<'_>]) -> Option<Layout> {
         let Some(rest) = path.strip_prefix(root_lower.as_str()) else {
             continue;
         };
-        if !entry.is_dir && (rest.starts_with("game/") || rest.starts_with("renpy/")) {
+        if !entry.is_dir && is_story_file(rest) {
             file_count += 1;
             total_size += entry.size;
         }
@@ -223,7 +265,10 @@ mod tests {
         ];
         let layout = detect(&entries).unwrap();
         assert_eq!(layout.root, "");
-        assert_eq!(layout.file_count, 2);
+        assert_eq!(
+            layout.file_count, 2,
+            "only renpy/ and game/ belong to the story"
+        );
         assert!(layout.hints.contains(&"lib/py3-windows-x86_64".to_string()));
         assert!(layout.hints.contains(&"foo.exe+foo.py/.sh".to_string()));
     }
@@ -268,6 +313,46 @@ mod tests {
             file("copy/game/a.rpy"),
         ];
         assert_eq!(detect(&entries).unwrap().root, "");
+    }
+
+    #[test]
+    fn story_files_leave_out_what_only_a_desktop_needs() {
+        for rest in [
+            "game/script.rpa",
+            "game/python-packages/_speedups.so",
+            "renpy/__init__.py",
+            "characters/monika.chr",
+            "readme.txt",
+            "steam_appid.txt",
+            "extras/notes.py",
+        ] {
+            assert!(is_story_file(rest), "{rest}");
+        }
+        for rest in [
+            "lib/py3-windows-x86_64/python.exe",
+            "ddlc.app/contents/macos/ddlc",
+            "ddlc.exe",
+            "ddlc.sh",
+            "ddlc.py",
+            "steam_api64.dll",
+            "redist/vcredist.exe",
+            "plugins/libfoo.dylib",
+        ] {
+            assert!(!is_story_file(rest), "{rest}");
+        }
+    }
+
+    #[test]
+    fn story_size_counts_files_beside_game() {
+        let entries = [
+            file("DDLC.exe"),
+            file("DDLC.py"),
+            file("renpy/__init__.pyo"),
+            file("game/scripts.rpa"),
+            file("characters/monika.chr"),
+            file("lib/windows-i686/python.exe"),
+        ];
+        assert_eq!(detect(&entries).unwrap().file_count, 3);
     }
 
     #[test]

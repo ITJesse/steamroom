@@ -6,10 +6,14 @@ use super::renpy;
 use crate::error::RplnetError;
 use crate::error::RplnetNetworkFailure;
 use crate::error::RplnetSteamFailure;
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 use steamroom::cdn::CdnClient;
 use steamroom::cdn::CdnServerPool;
 use steamroom::cdn::ContentServer;
@@ -18,15 +22,14 @@ use steamroom::cdn::server::CdnServer;
 use steamroom::client::LoggedIn;
 use steamroom::client::SteamClient;
 use steamroom::depot::AppId;
+use steamroom::depot::ChunkId;
 use steamroom::depot::DepotId;
 use steamroom::depot::DepotKey;
 use steamroom::depot::ManifestId;
 use steamroom::depot::manifest::DepotManifest;
 use steamroom::depot::manifest::ManifestFile;
 use steamroom::error::ConnectionError;
-use steamroom_client::download::CdnChunkFetcher;
 use steamroom_client::download::ChunkFetcher;
-use tokio::sync::OnceCell;
 use tracing::info;
 use tracing::warn;
 
@@ -59,7 +62,8 @@ pub struct RplnetRenPyLayout {
     /// Directory holding `game/` and `renpy/`, relative to the depot root in
     /// the depot's case: empty, or ending in `/`.
     pub root: String,
-    /// Files under the root's `game/` and `renpy/`: what an import downloads.
+    /// Story files below the root (`renpy::is_story_file`): what an import
+    /// downloads.
     pub file_count: u64,
     pub total_size: u64,
     /// Supporting signs, for logs only.
@@ -70,20 +74,75 @@ pub struct RplnetRenPyLayout {
     pub version_files: Vec<String>,
 }
 
-/// Content servers for the session, fetched on first use.
-#[derive(Default)]
-pub(crate) struct Content {
-    servers: OnceCell<Arc<Servers>>,
+/// A CDN region: Steam picks content servers as if the request came from one
+/// of `probe_ips` (`ip_override`). The app has the list of regions.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct RplnetContentRegion {
+    pub id: String,
+    /// Addresses fixed in the region, tried in order.
+    pub probe_ips: Vec<String>,
+    /// Fragments of the host names expected there; a mismatch is logged.
+    pub expect_hosts: Vec<String>,
 }
 
-/// The CDN client and server pool; manifests use them directly, chunks
-/// through the fetcher's rotation and cooldown.
-type Servers = CdnChunkFetcher;
+/// How long a content server list is used before it is fetched again.
+const SERVERS_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Content servers for the session, per region, refreshed every
+/// [`SERVERS_TTL`].
+#[derive(Default)]
+pub(crate) struct Content {
+    region: std::sync::Mutex<Option<RplnetContentRegion>>,
+    servers: tokio::sync::Mutex<Option<CachedServers>>,
+}
+
+struct CachedServers {
+    region: Option<RplnetContentRegion>,
+    fetched: Instant,
+    servers: Arc<Servers>,
+}
+
+/// The CDN client and server pool every manifest and chunk request of a
+/// session shares, with the CDN auth tokens obtained so far.
+pub(crate) struct Servers {
+    cdn: CdnClient,
+    pool: CdnServerPool,
+    /// Per (depot, host): some depots need a token for each server.
+    tokens: std::sync::Mutex<HashMap<(u32, String), String>>,
+}
 
 impl Content {
-    async fn servers(&self, client: &SteamClient<LoggedIn>) -> Result<Arc<Servers>, RplnetError> {
-        self.servers
-            .get_or_try_init(|| async {
+    /// Use `region` for content servers from now on; `None` lets Steam pick.
+    pub(crate) fn set_region(&self, region: Option<RplnetContentRegion>) {
+        *self.region.lock().unwrap_or_else(|e| e.into_inner()) = region;
+    }
+
+    fn region(&self) -> Option<RplnetContentRegion> {
+        self.region
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Forget the server list, so the next request fetches a new one.
+    pub(crate) async fn invalidate(&self) {
+        *self.servers.lock().await = None;
+    }
+
+    pub(crate) async fn servers(
+        &self,
+        client: &SteamClient<LoggedIn>,
+    ) -> Result<Arc<Servers>, RplnetError> {
+        let region = self.region();
+        let mut cached = self.servers.lock().await;
+        if let Some(entry) = cached.as_ref()
+            && entry.region == region
+            && entry.fetched.elapsed() < SERVERS_TTL
+        {
+            return Ok(Arc::clone(&entry.servers));
+        }
+        let servers = match &region {
+            None => {
                 let directory = client
                     .get_content_servers(
                         ContentServerLocation::Automatic,
@@ -97,22 +156,22 @@ impl Content {
                         format!("no usable content server among {}", directory.len()),
                     ));
                 }
-                info!(
-                    "content servers: {}",
-                    servers
-                        .iter()
-                        .map(|s| format!("{}{}", s.host, if s.https { "" } else { " (http)" }))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                Ok(Arc::new(CdnChunkFetcher::new(
-                    CdnClient::with_client(crate::net::http()?.clone()),
-                    CdnServerPool::new(servers),
-                    None,
-                )))
-            })
-            .await
-            .cloned()
+                info!("content servers (automatic): {}", describe(&servers));
+                servers
+            }
+            Some(region) => regional_servers(client, region).await?,
+        };
+        let servers = Arc::new(Servers {
+            cdn: CdnClient::with_client(crate::net::http()?.clone()),
+            pool: CdnServerPool::new(servers),
+            tokens: std::sync::Mutex::new(HashMap::new()),
+        });
+        *cached = Some(CachedServers {
+            region,
+            fetched: Instant::now(),
+            servers: Arc::clone(&servers),
+        });
+        Ok(servers)
     }
 
     /// Inspect the depots of a game until one is Ren'Py or
@@ -149,7 +208,7 @@ impl Content {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let manifest = self.manifest(client, app_id, candidate, &key).await?;
+            let (_, manifest) = self.manifest(client, app_id, candidate, &key).await?;
             read += 1;
             let entries: Vec<_> = manifest
                 .files
@@ -182,7 +241,7 @@ impl Content {
                         .map(|(_, file)| *file)
                         .collect();
                     let written = self
-                        .write_files(client, candidate.depot_id, &key, &files, dir)
+                        .write_files(client, app_id, candidate.depot_id, &key, &files, dir)
                         .await?;
                     for lib in renpy::lib_directories(&listing, &layout.root) {
                         let path = dir.join(&layout.root).join("lib").join(lib);
@@ -215,13 +274,15 @@ impl Content {
         Ok(inspection)
     }
 
-    async fn manifest(
+    /// A depot manifest: the bytes as the CDN sent them, and parsed with its
+    /// file names decrypted.
+    pub(crate) async fn manifest(
         &self,
         client: &SteamClient<LoggedIn>,
         app_id: u32,
         candidate: &RplnetDepotCandidate,
         key: &DepotKey,
-    ) -> Result<DepotManifest, RplnetError> {
+    ) -> Result<(Bytes, DepotManifest), RplnetError> {
         let depot = DepotId(candidate.depot_id);
         let manifest_id = ManifestId(candidate.manifest_id);
         let code = client
@@ -241,12 +302,10 @@ impl Content {
                 // Some depots need a CDN auth token for the server.
                 let (server, _) = servers.pool.pick();
                 let server = server.clone();
-                let token = client
-                    .get_cdn_auth_token(AppId(app_id), depot, &server.host)
-                    .await?;
+                let token = servers.token(client, app_id, depot, &server.host).await?;
                 servers
                     .cdn
-                    .download_manifest(&server, depot, manifest_id, code, token.token.as_deref())
+                    .download_manifest(&server, depot, manifest_id, code, token.as_deref())
                     .await?
             }
             Err(e) => return Err(e.into()),
@@ -265,7 +324,7 @@ impl Content {
                 )
             })?;
         }
-        Ok(manifest)
+        Ok((raw, manifest))
     }
 
     /// Download whole small files into `dir`, at their depot paths. Every
@@ -273,12 +332,17 @@ impl Content {
     async fn write_files(
         &self,
         client: &SteamClient<LoggedIn>,
+        app_id: u32,
         depot_id: u32,
         key: &DepotKey,
         files: &[&ManifestFile],
         dir: &Path,
     ) -> Result<Vec<String>, RplnetError> {
-        let fetcher = self.servers(client).await?;
+        let fetcher = ContentFetcher {
+            servers: self.servers(client).await?,
+            client: client.clone(),
+            app_id,
+        };
         let mut written = Vec::new();
         for file in files {
             if file.size > VERSION_FILE_LIMIT {
@@ -327,6 +391,169 @@ impl Content {
         }
         Ok(written)
     }
+}
+
+impl Servers {
+    /// The CDN auth token for `depot` on `host`, asked for once and kept.
+    /// `None` when Steam issues none.
+    async fn token(
+        &self,
+        client: &SteamClient<LoggedIn>,
+        app_id: u32,
+        depot: DepotId,
+        host: &str,
+    ) -> Result<Option<String>, RplnetError> {
+        let key = (depot.0, host.to_string());
+        if let Some(token) = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(Some(token.clone()));
+        }
+        let token = client
+            .get_cdn_auth_token(AppId(app_id), depot, host)
+            .await?
+            .token
+            .filter(|token| !token.is_empty());
+        if let Some(token) = &token {
+            self.tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, token.clone());
+            info!("CDN auth token obtained for a depot on {host}");
+        }
+        Ok(token)
+    }
+}
+
+/// Chunk downloads over the session's server pool. A server that answers
+/// 401/403 is retried once with a CDN auth token for that depot and server.
+pub(crate) struct ContentFetcher {
+    pub(crate) servers: Arc<Servers>,
+    pub(crate) client: SteamClient<LoggedIn>,
+    pub(crate) app_id: u32,
+}
+
+impl ChunkFetcher for ContentFetcher {
+    async fn fetch_chunk(
+        &self,
+        depot_id: DepotId,
+        chunk_id: &ChunkId,
+    ) -> Result<Bytes, steamroom_client::download::BoxError> {
+        let (server, wait) = self.servers.pool.pick();
+        let server = server.clone();
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let cached = self
+            .servers
+            .tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(depot_id.0, server.host.clone()))
+            .cloned();
+        let mut result = self
+            .servers
+            .cdn
+            .download_chunk(&server, depot_id, chunk_id, cached.as_deref())
+            .await;
+        if cached.is_none()
+            && let Err(steamroom::Error::CdnStatus { status, .. }) = &result
+            && (status.as_u16() == 401 || status.as_u16() == 403)
+        {
+            let token = self
+                .servers
+                .token(&self.client, self.app_id, depot_id, &server.host)
+                .await
+                .map_err(|e| Box::new(e) as steamroom_client::download::BoxError)?;
+            result = self
+                .servers
+                .cdn
+                .download_chunk(&server, depot_id, chunk_id, token.as_deref())
+                .await;
+        }
+        match result {
+            Ok(data) => {
+                self.servers.pool.report_success(&server);
+                Ok(data)
+            }
+            Err(e) => {
+                let retry_after = match &e {
+                    steamroom::Error::CdnStatus { retry_after, .. } => {
+                        retry_after.map(Duration::from_secs)
+                    }
+                    _ => None,
+                };
+                self.servers.pool.report_failure(&server, retry_after);
+                Err(Box::new(e))
+            }
+        }
+    }
+}
+
+/// Content servers as Steam places them for `region`: the first probe
+/// address that yields any wins. None at all is `RegionUnavailable`.
+async fn regional_servers(
+    client: &SteamClient<LoggedIn>,
+    region: &RplnetContentRegion,
+) -> Result<Vec<CdnServer>, RplnetError> {
+    for probe in &region.probe_ips {
+        let Ok(ip) = probe.parse::<std::net::IpAddr>() else {
+            warn!("region {}: {probe} is not an IP address", region.id);
+            continue;
+        };
+        let directory = match client
+            .get_content_servers(
+                ContentServerLocation::IpOverride(ip),
+                Some(MAX_CONTENT_SERVERS),
+            )
+            .await
+        {
+            Ok(directory) => directory,
+            Err(e) => {
+                warn!("region {} via {probe}: {}", region.id, RplnetError::from(e));
+                continue;
+            }
+        };
+        let servers = download_servers(&directory);
+        if servers.is_empty() {
+            warn!("region {} via {probe}: no usable content server", region.id);
+            continue;
+        }
+        let hosts = describe(&servers);
+        info!(
+            "content servers (region {} via {probe}): {hosts}",
+            region.id
+        );
+        if !region.expect_hosts.is_empty()
+            && !servers.iter().any(|s| {
+                region
+                    .expect_hosts
+                    .iter()
+                    .any(|expected| s.host.contains(expected.as_str()))
+            })
+        {
+            warn!(
+                "region {}: hosts do not match {:?}",
+                region.id, region.expect_hosts
+            );
+        }
+        return Ok(servers);
+    }
+    Err(RplnetError::steam(
+        RplnetSteamFailure::RegionUnavailable,
+        format!("no content servers for region {}", region.id),
+    ))
+}
+
+fn describe(servers: &[CdnServer]) -> String {
+    servers
+        .iter()
+        .map(|s| format!("{}{}", s.host, if s.https { "" } else { " (http)" }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
