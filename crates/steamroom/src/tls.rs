@@ -26,4 +26,6 @@ pub fn ensure_crypto_provider() {
 }
 
 #[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
-compile_error!("steamroom requires a rustls crypto provider: enable the `ring` (default) or `aws-lc-rs` feature");
+compile_error!(
+    "steamroom requires a rustls crypto provider: enable the `ring` (default) or `aws-lc-rs` feature"
+);

@@ -476,6 +476,21 @@ async fn heartbeats_follow_the_logon_interval() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_heartbeat_that_cannot_be_sent_closes_the_connection() {
+    let (client, mut server) = ready_client().await;
+    let login = tokio::spawn(client.login(ClientMsg::new(EMsg::CLIENT_LOGON)));
+    assert_eq!(server.next_sent().await.emsg, EMsg::CLIENT_LOGON);
+    server.push(logon_response_with_heartbeat(Some(2)));
+    let (client, _) = login.await.unwrap().unwrap();
+    assert!(client.is_connected());
+
+    // Sends fail; nothing arrives either way.
+    server.peer.stop_receiving();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!client.is_connected());
+}
+
 async fn content_server_request(
     location: ContentServerLocation,
 ) -> generated::CContentServerDirectoryGetServersForSteamPipeRequest {

@@ -101,6 +101,13 @@ impl MemoryPeer {
         self.to_client = None;
     }
 
+    /// Stop taking what the client sends, without closing the CM side: its
+    /// sends fail while its receive keeps waiting, as on a half-open
+    /// connection.
+    pub fn stop_receiving(&mut self) {
+        self.from_client.close();
+    }
+
     /// Whether the client side has released the transport.
     pub fn transport_dropped(&self) -> bool {
         self.transport_dropped.load(Ordering::SeqCst)

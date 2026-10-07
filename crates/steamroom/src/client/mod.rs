@@ -52,6 +52,7 @@ use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tracing::debug;
+use tracing::warn;
 
 pub const PROTOCOL_VERSION: u32 = 65581;
 
@@ -148,6 +149,11 @@ impl ClientInner {
     /// Send `CMsgClientHeartBeat` every `interval` until the connection
     /// closes. A CM drops a session that stays silent for longer than the
     /// interval it announced at logon, which a long download easily does.
+    ///
+    /// A heartbeat that cannot be sent closes the connection: the transport
+    /// is broken, and a receive side left waiting on it (a half-open TCP
+    /// connection after the network changed) would otherwise keep every
+    /// request waiting for an answer that never comes.
     fn start_heartbeat(&self, interval: std::time::Duration) {
         let channel = Arc::clone(&self.channel);
         let dispatcher = Arc::clone(&self.dispatcher);
@@ -164,7 +170,8 @@ impl ClientInner {
                     return;
                 }
                 if let Err(e) = channel.send(&packet).await {
-                    debug!(error = %e, "heartbeat send failed; stopping heartbeats");
+                    warn!(error = %e, "heartbeat send failed; closing the connection");
+                    dispatcher.close();
                     return;
                 }
             }
