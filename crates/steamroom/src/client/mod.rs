@@ -1,8 +1,16 @@
+/// Background receive loop and request/response routing.
+pub mod dispatch;
 /// Client message construction and header encoding.
 pub mod msg;
 /// Multi-message unpacking (gzip-compressed message batches).
 pub mod multi;
 
+use self::dispatch::Channel;
+use self::dispatch::Dispatcher;
+pub use self::dispatch::EVENT_BUFFER;
+pub use self::dispatch::Job;
+pub use self::dispatch::JobId;
+use self::dispatch::Tasks;
 use self::msg::ClientMsg;
 use crate::apps::AccessToken;
 use crate::apps::AppInfo;
@@ -39,16 +47,18 @@ use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tracing::debug;
-use tracing::trace;
 
 pub const PROTOCOL_VERSION: u32 = 65581;
 
 struct ClientInner {
-    transport: Box<dyn Transport>,
-    cipher: OnceLock<crate::connection::encryption::SessionCipher>,
+    channel: Arc<Channel>,
+    dispatcher: Arc<Dispatcher>,
     steam_id: AtomicU64,
     session_id: AtomicI32,
     source_job_id: AtomicU64,
+    /// Receive loop (and, once logged in, the heartbeat). Dropped, and so
+    /// aborted, with the last client handle.
+    tasks: Tasks,
 }
 
 pub struct SteamClient<S: Clone> {
@@ -96,57 +106,146 @@ impl ServiceResponse {
     }
 }
 
-impl SteamClient<Disconnected> {
-    pub async fn connect<T: Transport>(
-        transport: T,
-    ) -> Result<(SteamClient<Connected>, async_channel::Receiver<IncomingMsg>), Error> {
-        let (_tx, rx) = async_channel::unbounded();
-        let inner = Arc::new(ClientInner {
-            transport: Box::new(transport),
-            cipher: OnceLock::new(),
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        // A `Job` can outlive the client; closing wakes it with
+        // "disconnected" now that nothing will receive its responses.
+        self.dispatcher.close();
+    }
+}
+
+impl ClientInner {
+    fn new(transport: Arc<dyn Transport>) -> Arc<Self> {
+        Arc::new(ClientInner {
+            channel: Arc::new(Channel {
+                transport,
+                cipher: OnceLock::new(),
+            }),
+            dispatcher: Dispatcher::new(),
             steam_id: AtomicU64::new(0),
             session_id: AtomicI32::new(0),
             source_job_id: AtomicU64::new(1),
-        });
+            tasks: Tasks::default(),
+        })
+    }
 
+    /// Hand the receive side of the transport to the background loop. Called
+    /// once the connection no longer needs synchronous reads (after the TCP
+    /// encryption handshake, or immediately for WebSocket).
+    fn start_receiving(&self) {
+        let task = tokio::spawn(dispatch::receive_loop(
+            Arc::clone(&self.channel),
+            Arc::clone(&self.dispatcher),
+        ));
+        self.tasks.push(task.abort_handle());
+    }
+
+    async fn send_raw(&self, msg: &ClientMsg<'_>) -> Result<(), Error> {
+        if self.dispatcher.is_closed() {
+            return Err(ConnectionError::Disconnected.into());
+        }
+        self.channel.send(&msg.to_bytes()).await
+    }
+
+    fn next_job_id(&self) -> JobId {
+        JobId(self.source_job_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Register a job for `msg`, then send it. The job is registered first so
+    /// a fast response cannot arrive before anyone is listening for it.
+    async fn send_job(&self, msg: &mut ClientMsg<'_>) -> Result<Job, Error> {
+        let job = self.dispatcher.register_job(self.next_job_id())?;
+        msg.header.jobid_source = Some(job.id().0);
+        self.send_raw(msg).await?;
+        Ok(job)
+    }
+
+    async fn call_service(
+        &self,
+        mut msg: ClientMsg<'_>,
+        method_name: &str,
+    ) -> Result<ServiceResponse, Error> {
+        msg.header.target_job_name = Some(method_name.to_string());
+        let mut job = self.send_job(&mut msg).await?;
+        let incoming = job.recv_expect(EMsg::SERVICE_METHOD_RESPONSE).await?;
+        check_service_eresult(&incoming)?;
+        Ok(ServiceResponse {
+            body: incoming.body,
+        })
+    }
+
+    async fn send_hello(&self) -> Result<(), Error> {
+        let hello = generated::CMsgClientHello {
+            protocol_version: Some(PROTOCOL_VERSION),
+        };
+        let body = hello.encode_to_vec();
+        let msg = ClientMsg::with_body(EMsg::CLIENT_HELLO, &body);
+        self.send_raw(&msg).await
+    }
+}
+
+impl<S: Clone> SteamClient<S> {
+    /// Messages that are not a response to a request made through this client:
+    /// license list, account info, persona state, CM list, service
+    /// notifications, logoff. Every receiver returned here shares one queue,
+    /// so each message is delivered to one of them.
+    ///
+    /// The queue holds the last [`EVENT_BUFFER`] messages, so pushes that
+    /// arrive with the logon response can still be read after `login`
+    /// returns. Once the connection closes, receivers drain what is buffered
+    /// and then report the channel closed.
+    pub fn events(&self) -> async_channel::Receiver<IncomingMsg> {
+        self.inner.dispatcher.events()
+    }
+
+    /// False once the receive loop has stopped (the CM closed the connection
+    /// or the transport failed). Requests fail immediately from then on.
+    pub fn is_connected(&self) -> bool {
+        !self.inner.dispatcher.is_closed()
+    }
+}
+
+impl SteamClient<Disconnected> {
+    /// Wrap a TCP-style transport. Nothing is read until
+    /// [`encrypt`](SteamClient::encrypt) runs the channel handshake.
+    pub async fn connect<T: Transport>(
+        transport: T,
+    ) -> Result<(SteamClient<Connected>, async_channel::Receiver<IncomingMsg>), Error> {
+        let inner = ClientInner::new(Arc::new(transport));
+        let events = inner.dispatcher.events();
         Ok((
             SteamClient {
                 inner,
                 _state: Connected,
             },
-            rx,
+            events,
         ))
     }
 
-    /// Connect via WebSocket — skips encryption handshake (TLS handles it).
+    /// Connect via WebSocket -- skips encryption handshake (TLS handles it).
     /// Messages are sent/received as plaintext over the WebSocket.
     pub async fn connect_ws<T: Transport>(
         transport: T,
     ) -> Result<(SteamClient<Encrypted>, async_channel::Receiver<IncomingMsg>), Error> {
-        let (_tx, rx) = async_channel::unbounded();
-        let inner = Arc::new(ClientInner {
-            transport: Box::new(transport),
-            cipher: OnceLock::new(),
-            steam_id: AtomicU64::new(0),
-            session_id: AtomicI32::new(0),
-            source_job_id: AtomicU64::new(1),
-        });
-
+        let inner = ClientInner::new(Arc::new(transport));
+        inner.start_receiving();
+        let events = inner.dispatcher.events();
         Ok((
             SteamClient {
                 inner,
                 _state: Encrypted,
             },
-            rx,
+            events,
         ))
     }
 }
 
 impl SteamClient<Connected> {
     pub async fn encrypt(self) -> Result<SteamClient<Encrypted>, Error> {
+        let transport = &self.inner.channel.transport;
         debug!("waiting for ChannelEncryptRequest...");
         // Wait for ChannelEncryptRequest
-        let data = self.inner.transport.recv().await?;
+        let data = transport.recv().await?;
         debug!("received {} bytes", data.len());
         let parsed = header::PacketHeader::parse(&data)?;
         let (emsg, body) = match parsed {
@@ -202,10 +301,10 @@ impl SteamClient<Connected> {
             packet.len(),
             &packet[..std::cmp::min(64, packet.len())]
         );
-        self.inner.transport.send(&packet).await?;
+        transport.send(&packet).await?;
 
         // Wait for ChannelEncryptResult
-        let data = self.inner.transport.recv().await?;
+        let data = transport.recv().await?;
         let parsed = header::PacketHeader::parse(&data)?;
         let (emsg, body) = match parsed {
             PacketHeader::Simple { header, body } => (header.emsg, body),
@@ -228,46 +327,14 @@ impl SteamClient<Connected> {
 
         // Store the session cipher
         let cipher = crate::connection::encryption::SessionCipher::new(session_key);
-        let _ = self.inner.cipher.set(cipher);
+        let _ = self.inner.channel.cipher.set(cipher);
+        self.inner.start_receiving();
 
         debug!("encryption handshake complete");
         Ok(SteamClient {
             inner: self.inner,
             _state: Encrypted,
         })
-    }
-}
-
-impl ClientInner {
-    async fn send_raw(&self, msg: &ClientMsg<'_>) -> Result<(), Error> {
-        let data = msg.to_bytes();
-        if let Some(cipher) = self.cipher.get() {
-            let encrypted = cipher.encrypt(&data);
-            self.transport.send(&encrypted).await
-        } else {
-            self.transport.send(&data).await
-        }
-    }
-
-    async fn recv_raw(&self) -> Result<IncomingMsg, Error> {
-        let raw = self.transport.recv().await?;
-        let data = if let Some(cipher) = self.cipher.get() {
-            cipher
-                .decrypt(&raw)
-                .map_err(|_| ConnectionError::EncryptionFailed)?
-        } else {
-            raw.to_vec()
-        };
-        parse_incoming(&data)
-    }
-
-    async fn send_hello(&self) -> Result<(), Error> {
-        let hello = generated::CMsgClientHello {
-            protocol_version: Some(PROTOCOL_VERSION),
-        };
-        let body = hello.encode_to_vec();
-        let msg = ClientMsg::with_body(EMsg::CLIENT_HELLO, &body);
-        self.send_raw(&msg).await
     }
 }
 
@@ -286,88 +353,56 @@ impl SteamClient<Encrypted> {
 }
 
 impl SteamClient<Ready> {
+    /// Send `CMsgClientLogon` and wait for the logon response. Other messages
+    /// that arrive meanwhile, including ones in the same `MULTI` as the
+    /// response, go to [`events`](SteamClient::events).
     pub async fn login(
         self,
         msg: ClientMsg<'_>,
     ) -> Result<(SteamClient<LoggedIn>, IncomingMsg), Error> {
+        let response = self
+            .inner
+            .dispatcher
+            .wait_for_emsg(EMsg::CLIENT_LOG_ON_RESPONSE)?;
         self.inner.send_raw(&msg).await?;
+        let incoming = response.await.map_err(|_| ConnectionError::Disconnected)?;
 
-        // Process messages until we get LogOnResponse
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            debug!("login: received emsg={:?}", incoming.emsg);
-            match incoming.emsg {
-                EMsg::CLIENT_LOG_ON_RESPONSE => {
-                    let resp = generated::CMsgClientLogonResponse::decode(&*incoming.body)?;
-                    crate::enums::eresult(
-                        resp.eresult
-                            .ok_or(ConnectionError::MissingField("eresult"))?,
-                    )
-                    .map_err(ConnectionError::LogonFailed)?;
+        let resp = generated::CMsgClientLogonResponse::decode(&*incoming.body)?;
+        crate::enums::eresult(
+            resp.eresult
+                .ok_or(ConnectionError::MissingField("eresult"))?,
+        )
+        .map_err(ConnectionError::LogonFailed)?;
 
-                    if let Some(sid) = incoming.header.steamid {
-                        self.inner.steam_id.store(sid, Ordering::Relaxed);
-                    }
-                    if let Some(session_id) = incoming.header.client_sessionid {
-                        self.inner.session_id.store(session_id, Ordering::Relaxed);
-                    }
-
-                    debug!(
-                        "logged in, steamid={}",
-                        self.inner.steam_id.load(Ordering::Relaxed)
-                    );
-
-                    return Ok((
-                        SteamClient {
-                            inner: self.inner,
-                            _state: LoggedIn,
-                        },
-                        incoming,
-                    ));
-                }
-                EMsg::MULTI => {
-                    // Unpack multi and check for logon response inside
-                    let msgs = multi::unpack_multi(&incoming.body)?;
-                    for sub in msgs {
-                        let sub_msg = parse_incoming(&sub)?;
-                        if sub_msg.emsg == EMsg::CLIENT_LOG_ON_RESPONSE {
-                            let resp = generated::CMsgClientLogonResponse::decode(&*sub_msg.body)?;
-                            crate::enums::eresult(
-                                resp.eresult
-                                    .ok_or(ConnectionError::MissingField("eresult"))?,
-                            )
-                            .map_err(ConnectionError::LogonFailed)?;
-
-                            if let Some(sid) = sub_msg.header.steamid {
-                                self.inner.steam_id.store(sid, Ordering::Relaxed);
-                            }
-                            if let Some(session_id) = sub_msg.header.client_sessionid {
-                                self.inner.session_id.store(session_id, Ordering::Relaxed);
-                            }
-
-                            return Ok((
-                                SteamClient {
-                                    inner: self.inner,
-                                    _state: LoggedIn,
-                                },
-                                sub_msg,
-                            ));
-                        }
-                    }
-                }
-                _ => {
-                    trace!("login: ignoring {:?}", incoming.emsg);
-                }
-            }
+        if let Some(sid) = incoming.header.steamid {
+            self.inner.steam_id.store(sid, Ordering::Relaxed);
         }
+        if let Some(session_id) = incoming.header.client_sessionid {
+            self.inner.session_id.store(session_id, Ordering::Relaxed);
+        }
+
+        debug!(
+            "logged in, steamid={}",
+            self.inner.steam_id.load(Ordering::Relaxed)
+        );
+
+        Ok((
+            SteamClient {
+                inner: self.inner,
+                _state: LoggedIn,
+            },
+            incoming,
+        ))
     }
 
     pub async fn send_msg(&self, msg: &ClientMsg<'_>) -> Result<(), Error> {
         self.inner.send_raw(msg).await
     }
 
-    pub async fn recv_msg(&self) -> Result<IncomingMsg, Error> {
-        self.inner.recv_raw().await
+    /// Send `msg` as a job: `jobid_source` is assigned here, and every
+    /// response addressed to it is delivered to the returned [`Job`].
+    pub async fn send_job(&self, mut msg: ClientMsg<'_>) -> Result<Job, Error> {
+        self.inner.send_job(&mut msg).await
     }
 
     pub async fn call_service_method_non_authed(
@@ -375,35 +410,8 @@ impl SteamClient<Ready> {
         method_name: &str,
         body: &[u8],
     ) -> Result<ServiceResponse, Error> {
-        let job_id = self.inner.source_job_id.fetch_add(1, Ordering::Relaxed);
-        let mut msg = ClientMsg::with_body(EMsg::SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED, body);
-        msg.header.target_job_name = Some(method_name.to_string());
-        msg.header.jobid_source = Some(job_id);
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::SERVICE_METHOD_RESPONSE
-                && incoming.header.jobid_target == Some(job_id)
-            {
-                check_service_eresult(&incoming)?;
-                return Ok(ServiceResponse {
-                    body: incoming.body,
-                });
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::SERVICE_METHOD_RESPONSE
-                        && sub_msg.header.jobid_target == Some(job_id)
-                    {
-                        check_service_eresult(&sub_msg)?;
-                        return Ok(ServiceResponse { body: sub_msg.body });
-                    }
-                }
-            }
-        }
+        let msg = ClientMsg::with_body(EMsg::SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED, body);
+        self.inner.call_service(msg, method_name).await
     }
 
     pub async fn get_password_rsa_public_key(
@@ -533,8 +541,18 @@ impl SteamClient<LoggedIn> {
         self.inner.send_raw(msg).await
     }
 
-    pub async fn recv_msg(&self) -> Result<IncomingMsg, Error> {
-        self.inner.recv_raw().await
+    /// Send `msg` as a job: `jobid_source` is assigned here, and every
+    /// response addressed to it is delivered to the returned [`Job`].
+    pub async fn send_job(&self, mut msg: ClientMsg<'_>) -> Result<Job, Error> {
+        self.inner.send_job(&mut msg).await
+    }
+
+    /// Send a request and return its single response, which must carry
+    /// `response`.
+    async fn request(&self, emsg: EMsg, body: &[u8], response: EMsg) -> Result<IncomingMsg, Error> {
+        let mut msg = self.make_msg(emsg, body);
+        let mut job = self.inner.send_job(&mut msg).await?;
+        job.recv_expect(response).await
     }
 
     pub async fn send_heartbeat(&self) -> Result<(), Error> {
@@ -547,35 +565,8 @@ impl SteamClient<LoggedIn> {
         method_name: &str,
         body: &[u8],
     ) -> Result<ServiceResponse, Error> {
-        let job_id = self.inner.source_job_id.fetch_add(1, Ordering::Relaxed);
-        let mut msg = self.make_msg(EMsg::SERVICE_METHOD_CALL_FROM_CLIENT, body);
-        msg.header.target_job_name = Some(method_name.to_string());
-        msg.header.jobid_source = Some(job_id);
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::SERVICE_METHOD_RESPONSE
-                && incoming.header.jobid_target == Some(job_id)
-            {
-                check_service_eresult(&incoming)?;
-                return Ok(ServiceResponse {
-                    body: incoming.body,
-                });
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::SERVICE_METHOD_RESPONSE
-                        && sub_msg.header.jobid_target == Some(job_id)
-                    {
-                        check_service_eresult(&sub_msg)?;
-                        return Ok(ServiceResponse { body: sub_msg.body });
-                    }
-                }
-            }
-        }
+        let msg = self.make_msg(EMsg::SERVICE_METHOD_CALL_FROM_CLIENT, body);
+        self.inner.call_service(msg, method_name).await
     }
 
     pub async fn pics_get_access_tokens(
@@ -586,43 +577,22 @@ impl SteamClient<LoggedIn> {
             appids: app_ids.iter().map(|a| a.0).collect(),
             ..Default::default()
         };
-        let body = req.encode_to_vec();
-        let msg = self.make_msg(EMsg::CLIENT_PICS_ACCESS_TOKEN_REQUEST, &body); // k_EMsgClientPICSAccessTokenRequest
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE {
-                // k_EMsgClientPICSAccessTokenResponse
-                let resp = generated::CMsgClientPicsAccessTokenResponse::decode(&*incoming.body)?;
-                return Ok(resp
-                    .app_access_tokens
-                    .iter()
-                    .map(|t| AccessToken {
-                        app_id: AppId(t.appid.unwrap_or(0)), // appid echoed back from our request
-                        token: t.access_token.unwrap_or(0),  // 0 = no token needed (free app)
-                    })
-                    .collect());
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE {
-                        let resp =
-                            generated::CMsgClientPicsAccessTokenResponse::decode(&*sub_msg.body)?;
-                        return Ok(resp
-                            .app_access_tokens
-                            .iter()
-                            .map(|t| AccessToken {
-                                app_id: AppId(t.appid.unwrap_or(0)), // appid echoed back from our request
-                                token: t.access_token.unwrap_or(0), // 0 = no token needed (free app)
-                            })
-                            .collect());
-                    }
-                }
-            }
-        }
+        let incoming = self
+            .request(
+                EMsg::CLIENT_PICS_ACCESS_TOKEN_REQUEST,
+                &req.encode_to_vec(),
+                EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE,
+            )
+            .await?;
+        let resp = generated::CMsgClientPicsAccessTokenResponse::decode(&*incoming.body)?;
+        Ok(resp
+            .app_access_tokens
+            .iter()
+            .map(|t| AccessToken {
+                app_id: AppId(t.appid.unwrap_or(0)), // appid echoed back from our request
+                token: t.access_token.unwrap_or(0),  // 0 = no token needed (free app)
+            })
+            .collect())
     }
 
     pub async fn pics_get_product_info(&self, apps: &[AccessToken]) -> Result<Vec<AppInfo>, Error> {
@@ -640,45 +610,23 @@ impl SteamClient<LoggedIn> {
             meta_data_only: Some(false),
             ..Default::default()
         };
-        let body = req.encode_to_vec();
-        let msg = self.make_msg(EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST, &body); // k_EMsgClientPICSProductInfoRequest
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE {
-                // k_EMsgClientPICSProductInfoResponse
-                let resp = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
-                return Ok(resp
-                    .apps
-                    .iter()
-                    .map(|a| AppInfo {
-                        app_id: a.appid.map(AppId),
-                        change_number: a.change_number,
-                        kv_data: a.buffer.clone(),
-                    })
-                    .collect());
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE {
-                        let resp =
-                            generated::CMsgClientPicsProductInfoResponse::decode(&*sub_msg.body)?;
-                        return Ok(resp
-                            .apps
-                            .iter()
-                            .map(|a| AppInfo {
-                                app_id: a.appid.map(AppId),
-                                change_number: a.change_number,
-                                kv_data: a.buffer.clone(),
-                            })
-                            .collect());
-                    }
-                }
-            }
-        }
+        let incoming = self
+            .request(
+                EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST,
+                &req.encode_to_vec(),
+                EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
+            )
+            .await?;
+        let resp = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
+        Ok(resp
+            .apps
+            .iter()
+            .map(|a| AppInfo {
+                app_id: a.appid.map(AppId),
+                change_number: a.change_number,
+                kv_data: a.buffer.clone(),
+            })
+            .collect())
     }
 
     /// Fetch an app's PICS product info and decode it into a [`KeyValue`]
@@ -718,46 +666,24 @@ impl SteamClient<LoggedIn> {
             packageids: package_ids.iter().map(|p| p.0).collect(),
             ..Default::default()
         };
-        let body = req.encode_to_vec();
-        let msg = self.make_msg(EMsg::CLIENT_PICS_ACCESS_TOKEN_REQUEST, &body);
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE {
-                let resp = generated::CMsgClientPicsAccessTokenResponse::decode(&*incoming.body)?;
-                return Ok(resp
-                    .package_access_tokens
-                    .iter()
-                    .map(|t| {
-                        (
-                            PackageId(t.packageid.unwrap_or(0)),
-                            t.access_token.unwrap_or(0),
-                        )
-                    })
-                    .collect());
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE {
-                        let resp =
-                            generated::CMsgClientPicsAccessTokenResponse::decode(&*sub_msg.body)?;
-                        return Ok(resp
-                            .package_access_tokens
-                            .iter()
-                            .map(|t| {
-                                (
-                                    PackageId(t.packageid.unwrap_or(0)),
-                                    t.access_token.unwrap_or(0),
-                                )
-                            })
-                            .collect());
-                    }
-                }
-            }
-        }
+        let incoming = self
+            .request(
+                EMsg::CLIENT_PICS_ACCESS_TOKEN_REQUEST,
+                &req.encode_to_vec(),
+                EMsg::CLIENT_PICS_ACCESS_TOKEN_RESPONSE,
+            )
+            .await?;
+        let resp = generated::CMsgClientPicsAccessTokenResponse::decode(&*incoming.body)?;
+        Ok(resp
+            .package_access_tokens
+            .iter()
+            .map(|t| {
+                (
+                    PackageId(t.packageid.unwrap_or(0)),
+                    t.access_token.unwrap_or(0),
+                )
+            })
+            .collect())
     }
 
     pub async fn pics_get_package_info(
@@ -777,63 +703,28 @@ impl SteamClient<LoggedIn> {
             meta_data_only: Some(false),
             ..Default::default()
         };
-        let body = req.encode_to_vec();
-        let msg = self.make_msg(EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST, &body);
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE {
-                let resp = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
-                debug!(
-                    "package response: {} packages, unknown: {:?}",
-                    resp.packages.len(),
-                    resp.unknown_packageids
-                );
-                for p in &resp.packages {
-                    debug!(
-                        "  pkg {}: buffer={} bytes",
-                        p.packageid.unwrap_or(0),
-                        p.buffer.as_ref().map(|b| b.len()).unwrap_or(0)
-                    );
-                }
-                return Ok(resp
-                    .packages
-                    .iter()
-                    .map(|p| PackageInfo {
-                        package_id: p.packageid.map(PackageId),
-                        change_number: p.change_number,
-                        kv_data: p.buffer.clone(),
-                    })
-                    .collect());
-            }
-            debug!("pics_get_package_info: got emsg {:?}", incoming.emsg);
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    debug!("pics_get_package_info multi sub: {:?}", sub_msg.emsg);
-                    if sub_msg.emsg == EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE {
-                        let resp =
-                            generated::CMsgClientPicsProductInfoResponse::decode(&*sub_msg.body)?;
-                        debug!(
-                            "package response (multi): {} packages, unknown: {:?}",
-                            resp.packages.len(),
-                            resp.unknown_packageids
-                        );
-                        return Ok(resp
-                            .packages
-                            .iter()
-                            .map(|p| PackageInfo {
-                                package_id: p.packageid.map(PackageId),
-                                change_number: p.change_number,
-                                kv_data: p.buffer.clone(),
-                            })
-                            .collect());
-                    }
-                }
-            }
-        }
+        let incoming = self
+            .request(
+                EMsg::CLIENT_PICS_PRODUCT_INFO_REQUEST,
+                &req.encode_to_vec(),
+                EMsg::CLIENT_PICS_PRODUCT_INFO_RESPONSE,
+            )
+            .await?;
+        let resp = generated::CMsgClientPicsProductInfoResponse::decode(&*incoming.body)?;
+        debug!(
+            "package response: {} packages, unknown: {:?}",
+            resp.packages.len(),
+            resp.unknown_packageids
+        );
+        Ok(resp
+            .packages
+            .iter()
+            .map(|p| PackageInfo {
+                package_id: p.packageid.map(PackageId),
+                change_number: p.change_number,
+                kv_data: p.buffer.clone(),
+            })
+            .collect())
     }
 
     pub async fn get_depot_decryption_key(
@@ -845,25 +736,14 @@ impl SteamClient<LoggedIn> {
             depot_id: Some(depot_id.0),
             app_id: Some(app_id.0),
         };
-        let body = req.encode_to_vec();
-        let msg = self.make_msg(EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY, &body); // k_EMsgClientGetDepotDecryptionKey
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY_RESPONSE {
-                return Self::parse_depot_key_response(&incoming.body);
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY_RESPONSE {
-                        return Self::parse_depot_key_response(&sub_msg.body);
-                    }
-                }
-            }
-        }
+        let incoming = self
+            .request(
+                EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY,
+                &req.encode_to_vec(),
+                EMsg::CLIENT_GET_DEPOT_DECRYPTION_KEY_RESPONSE,
+            )
+            .await?;
+        Self::parse_depot_key_response(&incoming.body)
     }
 
     fn parse_depot_key_response(body: &[u8]) -> Result<DepotKey, Error> {
@@ -894,25 +774,14 @@ impl SteamClient<LoggedIn> {
             beta_name: Some(beta_name.to_string()),
             password_hash: Some(password_hash.to_vec()),
         };
-        let body = req.encode_to_vec();
-        let msg = self.make_msg(EMsg::CLIENT_PICS_PRIVATE_BETA_REQUEST, &body);
-        self.inner.send_raw(&msg).await?;
-
-        loop {
-            let incoming = self.inner.recv_raw().await?;
-            if incoming.emsg == EMsg::CLIENT_PICS_PRIVATE_BETA_RESPONSE {
-                return Self::parse_private_beta_response(&incoming.body);
-            }
-            if incoming.emsg == EMsg::MULTI {
-                let msgs = multi::unpack_multi(&incoming.body)?;
-                for sub in msgs {
-                    let sub_msg = parse_incoming(&sub)?;
-                    if sub_msg.emsg == EMsg::CLIENT_PICS_PRIVATE_BETA_RESPONSE {
-                        return Self::parse_private_beta_response(&sub_msg.body);
-                    }
-                }
-            }
-        }
+        let incoming = self
+            .request(
+                EMsg::CLIENT_PICS_PRIVATE_BETA_REQUEST,
+                &req.encode_to_vec(),
+                EMsg::CLIENT_PICS_PRIVATE_BETA_RESPONSE,
+            )
+            .await?;
+        Self::parse_private_beta_response(&incoming.body)
     }
 
     fn parse_private_beta_response(body: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -1011,22 +880,32 @@ impl SteamClient<LoggedIn> {
     }
 }
 
+impl IncomingMsg {
+    /// Parse one decrypted, unframed message (not a `MULTI` batch's body).
+    pub fn parse(data: &[u8]) -> Result<Self, Error> {
+        parse_incoming(data)
+    }
+}
+
 fn parse_incoming(data: &[u8]) -> Result<IncomingMsg, Error> {
     let parsed = header::PacketHeader::parse(data)?;
     match parsed {
-        PacketHeader::Protobuf { header: h, body } => {
-            let proto_header = h.decode_header().unwrap_or_default();
-            Ok(IncomingMsg {
-                emsg: h.emsg,
-                is_protobuf: true,
-                header: proto_header,
-                body,
-            })
-        }
+        PacketHeader::Protobuf { header: h, body } => Ok(IncomingMsg {
+            emsg: h.emsg,
+            is_protobuf: true,
+            header: h.decode_header()?,
+            body,
+        }),
+        // The job ids of the non-protobuf headers are carried over so their
+        // responses route like protobuf ones.
         PacketHeader::Simple { header: h, body } => Ok(IncomingMsg {
             emsg: h.emsg,
             is_protobuf: false,
-            header: generated::CMsgProtoBufHeader::default(),
+            header: generated::CMsgProtoBufHeader {
+                jobid_target: Some(h.target_job_id),
+                jobid_source: Some(h.source_job_id),
+                ..Default::default()
+            },
             body,
         }),
         PacketHeader::Extended { header: h, body } => Ok(IncomingMsg {
@@ -1035,6 +914,8 @@ fn parse_incoming(data: &[u8]) -> Result<IncomingMsg, Error> {
             header: generated::CMsgProtoBufHeader {
                 steamid: Some(h.steam_id),
                 client_sessionid: Some(h.session_id),
+                jobid_target: Some(h.target_job_id),
+                jobid_source: Some(h.source_job_id),
                 ..Default::default()
             },
             body,
@@ -1116,3 +997,6 @@ fn guard_type_from_proto(confirmation_type: Option<i32>) -> Option<GuardType> {
     // but unrecognized type is retained as GuardType::Unknown.
     Some(GuardType::from_proto(confirmation_type?))
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,5 +1,7 @@
 /// Serializable packet capture format for recording and replaying sessions.
 pub mod capture;
+/// In-memory transport for tests.
+pub mod memory;
 /// Wrap a transport to record all packets to a capture file.
 pub mod recording;
 /// Replay a previously captured session for deterministic testing.

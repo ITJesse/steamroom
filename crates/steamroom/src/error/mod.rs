@@ -73,6 +73,9 @@ pub enum ConnectionError {
     #[error("disconnected")]
     Disconnected,
 
+    #[error("MULTI messages nested too deeply")]
+    MultiTooDeep,
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
