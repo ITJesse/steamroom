@@ -29,6 +29,9 @@ impl EMsg {
     pub const CLIENT_CM_LIST: Self = Self(783);
     pub const CLIENT_GET_APP_OWNERSHIP_TICKET: Self = Self(813);
     pub const CLIENT_GET_APP_OWNERSHIP_TICKET_RESPONSE: Self = Self(814);
+    /// `CMsgClientRequestFriendData`: asks for the persona state of the
+    /// listed accounts, answered with `CLIENT_PERSONA_STATE`.
+    pub const CLIENT_REQUEST_FRIEND_DATA: Self = Self(815);
     pub const CHANNEL_ENCRYPT_REQUEST: Self = Self(1303);
     pub const CHANNEL_ENCRYPT_RESPONSE: Self = Self(1304);
     pub const CHANNEL_ENCRYPT_RESULT: Self = Self(1305);
