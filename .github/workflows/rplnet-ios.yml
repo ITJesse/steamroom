@@ -1,0 +1,122 @@
+name: rplnet iOS release
+
+# Builds RPLNet.xcframework for the RenPyLinter app from the renpylinter
+# branch and publishes it as rplnet-<crate version>-r<N> with a build
+# provenance attestation. The app pins the tarball's SHA-256 and verifies the
+# attestation against this workflow and branch (scripts/rplnet.lock.json in
+# the app repository).
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish an rplnet-<version>-r<N> release when tests and the build pass
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.0"
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Require the renpylinter branch
+        if: github.ref != 'refs/heads/renpylinter'
+        run: |
+          echo "rplnet releases are built from renpylinter only (got $GITHUB_REF)"
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target aarch64-apple-ios --target aarch64-apple-ios-sim
+          rustup default "$RUST_TOOLCHAIN"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: rplnet-ios-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rplnet-ios-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Test
+        run: cargo test --locked --workspace
+
+      - name: Build xcframework bundle
+        run: zsh crates/rplnet/build-xcframework.zsh dist
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rplnet"))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rplnet-ios-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    concurrency:
+      group: rplnet-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rplnet-ios-${{ github.run_id }}
+          path: dist
+
+      - name: Choose the release revision
+        id: tag
+        run: |
+          prefix="rplnet-${VERSION}-r"
+          last=$(gh release list --limit 1000 --json tagName \
+            --jq ".[].tagName | select(startswith(\"$prefix\")) | ltrimstr(\"$prefix\")" \
+            | sort -n | tail -1)
+          echo "tag=${prefix}$(( ${last:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Publish release
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "rplnet $VERSION for the RenPyLinter iOS app, built from $GITHUB_SHA by run $GITHUB_RUN_ID."
