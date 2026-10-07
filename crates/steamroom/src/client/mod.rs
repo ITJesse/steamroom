@@ -17,6 +17,7 @@ use crate::apps::AppInfo;
 use crate::apps::PackageAccessToken;
 use crate::apps::PackageInfo;
 use crate::auth::AuthClientId;
+use crate::auth::AuthPollStatus;
 use crate::auth::AuthSession;
 use crate::auth::AuthTokens;
 use crate::auth::GuardType;
@@ -514,11 +515,13 @@ impl SteamClient<Ready> {
         })
     }
 
+    /// Ask once whether the auth session is approved. For a QR session the
+    /// answer may also replace the challenge; see [`AuthPollStatus`].
     pub async fn poll_auth_session(
         &self,
         client_id: AuthClientId,
         request_id: &[u8],
-    ) -> Result<Option<AuthTokens>, Error> {
+    ) -> Result<AuthPollStatus, Error> {
         let req = generated::CAuthenticationPollAuthSessionStatusRequest {
             client_id: Some(client_id.raw()),
             request_id: Some(request_id.to_vec()),
@@ -531,16 +534,22 @@ impl SteamClient<Ready> {
             )
             .await?;
         let r: generated::CAuthenticationPollAuthSessionStatusResponse = resp.decode()?;
-        if let (Some(access), Some(refresh)) = (r.access_token.as_ref(), r.refresh_token.as_ref())
-            && !access.is_empty()
-        {
-            return Ok(Some(AuthTokens {
-                access_token: access.clone(),
-                refresh_token: refresh.clone(),
-                account_name: r.account_name,
-            }));
-        }
-        Ok(None)
+        let tokens = match (r.access_token, r.refresh_token) {
+            (Some(access_token), Some(refresh_token)) if !access_token.is_empty() => {
+                Some(AuthTokens {
+                    access_token,
+                    refresh_token,
+                    account_name: r.account_name,
+                })
+            }
+            _ => None,
+        };
+        Ok(AuthPollStatus {
+            tokens,
+            new_client_id: r.new_client_id.map(AuthClientId::new),
+            new_challenge_url: r.new_challenge_url.filter(|url| !url.is_empty()),
+            had_remote_interaction: r.had_remote_interaction.unwrap_or(false),
+        })
     }
 
     pub async fn submit_steam_guard_code(

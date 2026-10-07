@@ -1,12 +1,12 @@
 use crate::login::BuilderConfig;
 use crate::login::STEAM_CLIENT_PLATFORM_TYPE;
 use crate::login::TransportConfig;
-use crate::login::credentials::poll_until_tokens;
 use crate::login::error::LoginError;
 use crate::login::establish_ready_client;
 use crate::login::terminal::ApprovedAuth;
 
 use steamroom::auth::AuthClientId;
+use steamroom::auth::AuthTokens;
 use steamroom::auth::GuardType;
 use steamroom::auth::PollInterval;
 use steamroom::client::Ready;
@@ -22,8 +22,13 @@ pub struct QrLogin {
 }
 
 /// QR auth session in progress: the caller renders `challenge_url()` as a QR
-/// code (or prints it), then calls `wait_for_scan()` to block until the user
-/// approves on their Steam mobile app.
+/// code (or prints it), then calls `poll()` until the user approves on their
+/// Steam mobile app.
+///
+/// Steam replaces the challenge every so often while the session is pending;
+/// the previous URL then stops working and later polls must carry the new
+/// client id. [`poll`](QrLoginFlow::poll) follows the replacement and reports
+/// it so the caller can redraw the code.
 pub struct QrLoginFlow {
     client: SteamClient<Ready>,
     config: BuilderConfig,
@@ -69,6 +74,19 @@ impl QrLogin {
     }
 }
 
+/// Outcome of one [`QrLoginFlow::poll`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum QrPoll {
+    /// Not approved yet.
+    Pending,
+    /// Steam replaced the challenge: show [`QrLoginFlow::challenge_url`]
+    /// again, the previous code can no longer be scanned.
+    ChallengeChanged,
+    /// Approved; pass the tokens to [`QrLoginFlow::into_approved`].
+    Approved(AuthTokens),
+}
+
 impl QrLoginFlow {
     /// URL to encode as a QR code or print for the user. The caller picks
     /// the renderer (the steamroom CLI uses the `qrcode` crate).
@@ -82,20 +100,45 @@ impl QrLoginFlow {
         &self.allowed_kinds
     }
 
-    /// Poll `PollAuthSessionStatus` until the user scans + approves and
-    /// tokens are returned.
-    pub async fn wait_for_scan(self) -> Result<ApprovedAuth, LoginError> {
-        let tokens = poll_until_tokens(
-            &self.client,
-            self.client_id,
-            &self.request_id,
-            self.poll_interval,
-        )
-        .await?;
-        Ok(ApprovedAuth {
+    /// Wait the server's poll interval, then ask `PollAuthSessionStatus` once.
+    pub async fn poll(&mut self) -> Result<QrPoll, LoginError> {
+        tokio::time::sleep(self.poll_interval.as_duration()).await;
+        let status = self
+            .client
+            .poll_auth_session(self.client_id, &self.request_id)
+            .await?;
+        if let Some(tokens) = status.tokens {
+            return Ok(QrPoll::Approved(tokens));
+        }
+        if let Some(client_id) = status.new_client_id {
+            self.client_id = client_id;
+        }
+        match status.new_challenge_url {
+            Some(url) => {
+                self.challenge_url = url;
+                Ok(QrPoll::ChallengeChanged)
+            }
+            None => Ok(QrPoll::Pending),
+        }
+    }
+
+    /// Wrap the tokens from [`QrPoll::Approved`] for the final logon.
+    pub fn into_approved(self, tokens: AuthTokens) -> ApprovedAuth {
+        ApprovedAuth {
             client: self.client,
             config: self.config,
             tokens,
-        })
+        }
+    }
+
+    /// Poll until the user scans and approves. Challenge replacements are
+    /// followed but not reported, so this only suits a caller that cannot
+    /// redraw the code; otherwise drive [`poll`](QrLoginFlow::poll) directly.
+    pub async fn wait_for_scan(mut self) -> Result<ApprovedAuth, LoginError> {
+        loop {
+            if let QrPoll::Approved(tokens) = self.poll().await? {
+                return Ok(self.into_approved(tokens));
+            }
+        }
     }
 }

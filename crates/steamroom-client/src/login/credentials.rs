@@ -223,13 +223,29 @@ impl ConfirmationChallenge {
     /// [`submit_code`]: ConfirmationChallenge::submit_code
     /// [`into_approved`]: ConfirmationChallenge::into_approved
     pub async fn wait_for_tokens(&self) -> Result<AuthTokens, LoginError> {
-        poll_until_tokens(
-            &self.client,
-            self.client_id,
-            &self.request_id,
-            self.poll_interval,
-        )
-        .await
+        loop {
+            if let Some(tokens) = self.poll().await? {
+                return Ok(tokens);
+            }
+        }
+    }
+
+    /// Wait the server's poll interval, then ask `PollAuthSessionStatus` once.
+    /// `None` means the session is still pending. [`wait_for_tokens`] is this
+    /// in a loop; call it directly to stop between polls (to cancel, or to
+    /// report progress).
+    ///
+    /// Borrows `&self` so it can run concurrently with [`submit_code`].
+    ///
+    /// [`wait_for_tokens`]: ConfirmationChallenge::wait_for_tokens
+    /// [`submit_code`]: ConfirmationChallenge::submit_code
+    pub async fn poll(&self) -> Result<Option<AuthTokens>, LoginError> {
+        tokio::time::sleep(self.poll_interval.as_duration()).await;
+        let status = self
+            .client
+            .poll_auth_session(self.client_id, &self.request_id)
+            .await?;
+        Ok(status.tokens)
     }
 
     /// Consume the challenge, wrapping issued tokens for the final logon.
@@ -256,10 +272,9 @@ impl ConfirmationChallenge {
     }
 }
 
-/// Poll `PollAuthSessionStatus` until tokens are returned. Used by the
-/// guard-code and mobile-confirmation completion paths, and by the no-2FA
+/// Poll `PollAuthSessionStatus` until tokens are returned. Used by the no-2FA
 /// path in `begin()`.
-pub(crate) async fn poll_until_tokens(
+async fn poll_until_tokens(
     client: &SteamClient<Ready>,
     client_id: AuthClientId,
     request_id: &[u8],
@@ -267,7 +282,11 @@ pub(crate) async fn poll_until_tokens(
 ) -> Result<AuthTokens, LoginError> {
     loop {
         tokio::time::sleep(interval.as_duration()).await;
-        if let Some(tokens) = client.poll_auth_session(client_id, request_id).await? {
+        if let Some(tokens) = client
+            .poll_auth_session(client_id, request_id)
+            .await?
+            .tokens
+        {
             return Ok(tokens);
         }
     }

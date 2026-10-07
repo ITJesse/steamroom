@@ -14,6 +14,7 @@ mod error;
 mod qr;
 pub use qr::QrLogin;
 pub use qr::QrLoginFlow;
+pub use qr::QrPoll;
 mod terminal;
 pub use terminal::AnonymousLogin;
 pub use terminal::ApprovedAuth;

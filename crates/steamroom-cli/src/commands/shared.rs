@@ -24,6 +24,7 @@ use steamroom_client::login::CredentialsLoginFlow;
 use steamroom_client::login::GuardType;
 use steamroom_client::login::LoginBuilder;
 use steamroom_client::login::LoginError;
+use steamroom_client::login::QrPoll;
 use tracing::info;
 use tracing::warn;
 
@@ -617,22 +618,34 @@ pub fn preferred_kind(kinds: &[GuardType]) -> GuardType {
     }
 }
 
-pub async fn drive_qr_flow(
-    builder: LoginBuilder,
-    username: &str,
-) -> Result<SteamClient<LoggedIn>, CliError> {
-    info!("generating QR code...");
-    let flow = builder.with_qr().begin().await?;
-
-    let url = flow.challenge_url();
+fn print_qr_challenge(url: &str) -> Result<(), CliError> {
     let qr =
         qrcode::QrCode::new(url.as_bytes()).map_err(|e| CliError::Io(std::io::Error::other(e)))?;
     let rendered = qr.render::<qrcode::render::unicode::Dense1x2>().build();
     eprintln!("{rendered}");
     eprintln!("Scan this QR code with the Steam mobile app");
     eprintln!("Or open: {url}");
+    Ok(())
+}
 
-    let approved = flow.wait_for_scan().await?;
+pub async fn drive_qr_flow(
+    builder: LoginBuilder,
+    username: &str,
+) -> Result<SteamClient<LoggedIn>, CliError> {
+    info!("generating QR code...");
+    let mut flow = builder.with_qr().begin().await?;
+    print_qr_challenge(flow.challenge_url())?;
+
+    let approved = loop {
+        match flow.poll().await? {
+            QrPoll::Approved(tokens) => break flow.into_approved(tokens),
+            QrPoll::ChallengeChanged => {
+                eprintln!("The QR code expired; scan this one instead");
+                print_qr_challenge(flow.challenge_url())?;
+            }
+            _ => {}
+        }
+    };
     let tokens = approved.tokens();
     save_token(
         tokens.account_name.as_deref().unwrap_or(username),

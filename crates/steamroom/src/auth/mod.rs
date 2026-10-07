@@ -76,6 +76,23 @@ pub struct AuthTokens {
     pub account_name: Option<String>,
 }
 
+/// One `PollAuthSessionStatus` answer.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct AuthPollStatus {
+    /// Issued once the session is approved; `None` while it is pending.
+    pub tokens: Option<AuthTokens>,
+    /// QR sessions only: Steam replaced the challenge. Later polls must use
+    /// this id, and the previous challenge URL can no longer be scanned.
+    pub new_client_id: Option<AuthClientId>,
+    /// QR sessions only: the URL to show in place of the previous one. Sent
+    /// together with `new_client_id`.
+    pub new_challenge_url: Option<String>,
+    /// The user has acted on the session elsewhere (scanned the QR code or
+    /// opened the approval prompt) without having approved it yet.
+    pub had_remote_interaction: bool,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum GuardType {
