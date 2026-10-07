@@ -63,8 +63,15 @@ pub enum EResultError {
     PersistFailed,
     LockingFailed,
     LogonSessionReplaced,
+    /// The logon was refused; Steam gives no further reason.
+    AccountLogonDenied,
+    /// The Steam Guard email code is wrong.
+    InvalidLoginAuthCode,
+    /// The Steam Guard email code has expired.
+    ExpiredLoginAuthCode,
     RateLimitExceeded,
     TwoFactorRequired,
+    /// Too many failed logons from this account or network for now.
     LoginDeniedThrottle,
     TwoFactorCodeMismatch,
     TwoFactorActivationCodeMismatch,
@@ -119,8 +126,12 @@ impl EResultError {
             32 => Self::PersistFailed,
             33 => Self::LockingFailed,
             34 => Self::LogonSessionReplaced,
+            63 => Self::AccountLogonDenied,
+            65 => Self::InvalidLoginAuthCode,
+            71 => Self::ExpiredLoginAuthCode,
             84 => Self::RateLimitExceeded,
             85 => Self::TwoFactorRequired,
+            87 => Self::LoginDeniedThrottle,
             88 => Self::TwoFactorCodeMismatch,
             89 => Self::TwoFactorActivationCodeMismatch,
             other => Self::Unknown(other),
@@ -336,6 +347,19 @@ mod tests {
     // The two bit values pinned to a primary source: Directory (0x40, observed
     // on real directory entries) and Symlink (0x200, the bit Steam's own
     // contentmanifest.cpp asserts). The contiguous layout follows from them.
+    #[test]
+    fn steam_guard_eresults_are_named() {
+        for (code, expected) in [
+            (63, EResultError::AccountLogonDenied),
+            (65, EResultError::InvalidLoginAuthCode),
+            (71, EResultError::ExpiredLoginAuthCode),
+            (87, EResultError::LoginDeniedThrottle),
+            (88, EResultError::TwoFactorCodeMismatch),
+        ] {
+            assert_eq!(EResultError::from_code(code), expected);
+        }
+    }
+
     #[test]
     fn depot_file_flag_values_match_steam() {
         assert_eq!(DepotFileFlags::DIRECTORY.bits(), 0x40);

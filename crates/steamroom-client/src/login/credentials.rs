@@ -204,9 +204,13 @@ impl ConfirmationChallenge {
             .await
         {
             Ok(()) => Ok(()),
+            // A wrong authenticator code is TwoFactorCodeMismatch; a wrong or
+            // stale email code is InvalidLoginAuthCode / ExpiredLoginAuthCode.
             Err(steamroom::Error::Connection(
                 steamroom::error::ConnectionError::ServiceMethodFailed(
-                    steamroom::enums::EResultError::TwoFactorCodeMismatch,
+                    steamroom::enums::EResultError::TwoFactorCodeMismatch
+                    | steamroom::enums::EResultError::InvalidLoginAuthCode
+                    | steamroom::enums::EResultError::ExpiredLoginAuthCode,
                 ),
             )) => Err(LoginError::InvalidGuardCode),
             Err(e) => Err(LoginError::Transport(e)),
