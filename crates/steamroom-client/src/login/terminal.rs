@@ -88,6 +88,20 @@ impl ApprovedAuth {
         &self.tokens
     }
 
+    /// False once the CM has closed this connection. The tokens stay
+    /// valid; log on over another connection with
+    /// [`continue_on`](Self::continue_on).
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
+    /// Go on over `client`, a new connection that has been through
+    /// `connect → encrypt → prepare`. The logon then uses the issued refresh
+    /// token like any other token logon.
+    pub fn continue_on(&mut self, client: SteamClient<Ready>) {
+        self.client = client;
+    }
+
     pub async fn finish(self) -> Result<SteamClient<LoggedIn>, LoginError> {
         let AuthTokens {
             refresh_token,

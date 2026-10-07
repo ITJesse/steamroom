@@ -193,3 +193,43 @@ async fn wrong_or_expired_email_codes_can_be_retried() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_challenge_continues_on_a_new_connection() {
+    let (mut peer, mut challenge) = challenge(&[GuardType::DeviceConfirmation]).await;
+    peer.close();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while challenge.is_connected() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the closed connection was not noticed");
+
+    let (transport, mut peer) = MemoryTransport::pair();
+    let (client, _events) = SteamClient::connect_ws(transport).await.unwrap();
+    let client = client.prepare().await.unwrap();
+    assert_eq!(next_call(&mut peer).await.emsg, EMsg::CLIENT_HELLO);
+    challenge.continue_on(client);
+    assert!(challenge.is_connected());
+
+    let poll = tokio::spawn(async move { challenge.poll().await });
+    let call = next_call(&mut peer).await;
+    let request =
+        generated::CAuthenticationPollAuthSessionStatusRequest::decode(&*call.body).unwrap();
+    assert_eq!(request.client_id, Some(5));
+    assert_eq!(request.request_id.as_deref(), Some(&[1u8, 2, 3][..]));
+    reply(
+        &peer,
+        &call,
+        generated::CAuthenticationPollAuthSessionStatusResponse {
+            access_token: Some("access".to_string()),
+            refresh_token: Some("refresh".to_string()),
+            account_name: Some("account".to_string()),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    );
+    let tokens = poll.await.unwrap().unwrap().expect("approved");
+    assert_eq!(tokens.refresh_token, "refresh");
+}

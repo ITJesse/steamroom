@@ -177,6 +177,22 @@ impl ConfirmationChallenge {
         &self.confirmation_kinds
     }
 
+    /// False once the CM has closed this connection. The pending sign-in
+    /// lives on Steam's side and outlasts it; go on with
+    /// [`continue_on`](Self::continue_on).
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
+    /// Go on over `client`, a new connection that has been through
+    /// `connect → encrypt → prepare`. A CM closes a connection that has not
+    /// logged on after about a minute, and a mobile app loses its connections
+    /// in the background, while the user may take longer than that to
+    /// approve.
+    pub fn continue_on(&mut self, client: SteamClient<Ready>) {
+        self.client = client;
+    }
+
     /// Whether a Steam Guard code may be submitted.
     pub fn accepts_code(&self) -> bool {
         !self.code_kinds.is_empty()
