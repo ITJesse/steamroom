@@ -6,8 +6,11 @@ use bytes::Bytes;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::Mutex;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::Connector;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 
 type WsStream =
@@ -27,14 +30,16 @@ impl WebSocketTransport {
 
         let url = format!("wss://{host}:{port}/cmsocket/");
         tracing::debug!("websocket connecting to {url}");
-        crate::tls::ensure_crypto_provider();
+        let connector = Connector::Rustls(tls_config()?);
 
-        let (ws, _) = connect_async(&url).await.map_err(|e| {
-            ConnectionError::Io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                e,
-            ))
-        })?;
+        let (ws, _) = connect_async_tls_with_config(&url, None, false, Some(connector))
+            .await
+            .map_err(|e| {
+                ConnectionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    e,
+                ))
+            })?;
 
         let (sink, stream) = ws.split();
         Ok(Self {
@@ -42,6 +47,21 @@ impl WebSocketTransport {
             stream: Mutex::new(stream),
         })
     }
+}
+
+/// TLS settings for CM WebSocket connections, verified by the platform
+/// (Security.framework on Apple platforms). Built once per process.
+fn tls_config() -> Result<Arc<rustls::ClientConfig>, Error> {
+    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(Arc::clone(config));
+    }
+    crate::tls::ensure_crypto_provider();
+    use rustls_platform_verifier::ConfigVerifierExt;
+    let config = Arc::new(
+        rustls::ClientConfig::with_platform_verifier().map_err(ConnectionError::TlsConfig)?,
+    );
+    Ok(Arc::clone(CONFIG.get_or_init(|| config)))
 }
 
 impl Transport for WebSocketTransport {

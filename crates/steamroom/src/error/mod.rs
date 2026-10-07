@@ -73,6 +73,9 @@ pub enum ConnectionError {
     #[error("disconnected")]
     Disconnected,
 
+    #[error("TLS configuration: {0}")]
+    TlsConfig(rustls::Error),
+
     #[error("MULTI messages nested too deeply")]
     MultiTooDeep,
 

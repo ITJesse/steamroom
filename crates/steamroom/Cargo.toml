@@ -56,6 +56,7 @@ async-channel = { workspace = true }
 # Runtime-specific: only needed for transport impls, not core library
 reqwest = { workspace = true }
 rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 
