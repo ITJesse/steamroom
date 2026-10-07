@@ -21,6 +21,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use steamroom::crypto;
+use steamroom::depot::ChunkId;
 use steamroom::depot::DepotKey;
 use steamroom::depot::chunk;
 use steamroom::types::key_value::KeyValue;
@@ -44,6 +45,7 @@ fn main() {
     let encrypted_iv = crypto::symmetric_encrypt_ecb_nopad(&iv, &key).unwrap();
     let depot_key = DepotKey(key);
     let checksum = SteamAdler32::compute(&plaintext);
+    let chunk_id = ChunkId(Sha1Hash::compute(&plaintext).0);
     let mut chunk_data = Vec::with_capacity(encrypted_iv.len() + ciphertext.len());
     chunk_data.extend_from_slice(&encrypted_iv);
     chunk_data.extend_from_slice(&ciphertext);
@@ -60,8 +62,14 @@ fn main() {
         }),
         ("chunk-process", &|| {
             black_box(
-                chunk::process_chunk(&chunk_data, &depot_key, plaintext.len() as u32, checksum.0)
-                    .unwrap(),
+                chunk::process_chunk(
+                    &chunk_data,
+                    &depot_key,
+                    &chunk_id,
+                    plaintext.len() as u32,
+                    checksum.0,
+                )
+                .unwrap(),
             );
         }),
         ("checksum-adler", &|| {

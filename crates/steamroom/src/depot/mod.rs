@@ -44,6 +44,11 @@ pub struct PackageId(pub u32);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChunkId(pub [u8; 20]);
 
+impl ChunkId {
+    /// The id of a manifest chunk that carries no SHA-1.
+    pub const UNIDENTIFIED: ChunkId = ChunkId([0; 20]);
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DepotKey(pub [u8; 32]);

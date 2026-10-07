@@ -525,7 +525,8 @@ impl DepotJob {
 
             // Check if file already matches the manifest (skip if up-to-date)
             let expected_size = file.size;
-            if self.verify && file_matches(&file_path, expected_size, file.sha_content.as_ref()) {
+            if self.verify && file_matches(&file_path, expected_size, file.content_sha1().as_ref())
+            {
                 // Content matches; reconcile the executable bit so verify also
                 // repairs a file whose flags no longer match the manifest.
                 self.reconcile_flags(flags, &file_path, filename, attach_file)?;
@@ -827,23 +828,24 @@ impl DepotJob {
                 let attach_chunk_for_blocking = attach_chunk();
                 let attach_chunk_in_blocking = attach_chunk_for_blocking.clone();
                 tokio::task::spawn_blocking(move || -> Result<(), DownloadReport> {
-                    let processed = chunk::process_chunk(&raw, &depot_key, expected_size, checksum)
-                        .map_err(|e| report(e).attach(attach_chunk_in_blocking.clone()))?;
-                    // The chunk id is the SHA-1 of the uncompressed bytes, so
-                    // verify identity instead of trusting only the Adler-32 gate
-                    // in `process_chunk`. An all-zero id carries no identity to
-                    // check against; `process_chunk`'s size + checksum is then
-                    // all we have.
-                    if chunk_id != ChunkId([0u8; 20]) {
-                        let actual = sha1_of(&processed);
-                        if actual != chunk_id.0 {
-                            return Err(Report::new(DownloadError::ChunkSha1Mismatch {
-                                expected: chunk_id.0,
-                                actual,
-                            })
-                            .attach(attach_chunk_in_blocking.clone()));
-                        }
-                    }
+                    // `process_chunk` checks size, Adler-32 and the chunk id
+                    // (SHA-1 of the uncompressed bytes).
+                    let processed = chunk::process_chunk(
+                        &raw,
+                        &depot_key,
+                        &chunk_id,
+                        expected_size,
+                        checksum,
+                    )
+                    .map_err(|e| {
+                        let e = match e {
+                            chunk::ChunkError::Sha1Mismatch { expected, actual } => {
+                                DownloadError::ChunkSha1Mismatch { expected, actual }
+                            }
+                            other => other.into(),
+                        };
+                        report(e).attach(attach_chunk_in_blocking.clone())
+                    })?;
                     let written = processed.len() as u64;
                     pwrite_all(out.as_ref(), &processed, chunk_offset)
                         .map_err(|e| report(e).attach(attach_chunk_in_blocking.clone()))?;
@@ -887,7 +889,7 @@ impl DepotJob {
         // id and fall back to the Adler-32 gate). This end-to-end pass is the
         // backstop for those id-less chunks and for assembly mistakes (a chunk
         // written at the wrong offset) that per-chunk checks cannot see.
-        if let Some(expected_sha) = file.sha_content.as_ref() {
+        if let Some(expected_sha) = file.content_sha1().as_ref() {
             let file_size = file.size;
             let out_for_hash = out.clone();
             let expected = *expected_sha;

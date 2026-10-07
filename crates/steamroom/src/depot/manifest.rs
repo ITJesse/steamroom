@@ -24,6 +24,12 @@ pub struct DepotManifest {
     pub files: Vec<ManifestFile>,
 }
 
+/// SHA-1 of zero bytes.
+const EMPTY_SHA1: [u8; 20] = [
+    0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60, 0x18, 0x90,
+    0xaf, 0xd8, 0x07, 0x09,
+];
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -48,6 +54,16 @@ impl ManifestFile {
             sha_content: None,
             chunks: vec![],
             link_target: None,
+        }
+    }
+
+    /// SHA-1 of the file's content. Steam writes an all-zero `sha_content`
+    /// for empty files instead of the SHA-1 of no data; this returns the real
+    /// digest for them, so it can be compared with a hash of the file on disk.
+    pub fn content_sha1(&self) -> Option<[u8; 20]> {
+        match self.sha_content {
+            Some(sha) if self.size == 0 && sha == [0; 20] => Some(EMPTY_SHA1),
+            other => other,
         }
     }
 
@@ -279,5 +295,36 @@ impl ManifestMagic {
             0x1F48_12BE => Ok(Self::Metadata), // V4 metadata
             _ => Err(ManifestError::InvalidMagic(val)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::checksum::Sha1Hash;
+
+    #[test]
+    fn empty_sha1_constant_is_the_digest_of_no_data() {
+        assert_eq!(EMPTY_SHA1, Sha1Hash::compute(&[]).0);
+    }
+
+    #[test]
+    fn empty_file_with_zero_sha_reports_the_empty_digest() {
+        let mut file = ManifestFile::new("empty.txt".into(), 0);
+        file.sha_content = Some([0; 20]);
+        assert_eq!(file.content_sha1(), Some(EMPTY_SHA1));
+    }
+
+    #[test]
+    fn other_files_report_their_sha_unchanged() {
+        let mut file = ManifestFile::new("a.txt".into(), 3);
+        file.sha_content = Some([7; 20]);
+        assert_eq!(file.content_sha1(), Some([7; 20]));
+        // Only the empty-file quirk is rewritten; a zero digest on a non-empty
+        // file stays as reported.
+        file.sha_content = Some([0; 20]);
+        assert_eq!(file.content_sha1(), Some([0; 20]));
+        file.sha_content = None;
+        assert_eq!(file.content_sha1(), None);
     }
 }

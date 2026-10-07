@@ -1,4 +1,6 @@
+use super::ChunkId;
 use super::DepotKey;
+use crate::util::checksum::Sha1Hash;
 use crate::util::checksum::SteamAdler32;
 use std::io::Read;
 
@@ -39,6 +41,12 @@ pub enum ChunkError {
     #[error("checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
     ChecksumMismatch { expected: u32, actual: u32 },
 
+    #[error("chunk content does not match its id (SHA-1)")]
+    Sha1Mismatch {
+        expected: [u8; 20],
+        actual: [u8; 20],
+    },
+
     #[error("empty archive")]
     EmptyArchive,
 
@@ -52,23 +60,24 @@ pub enum ChunkError {
     Zip(String),
 }
 
-/// Decrypt and decompress a raw depot chunk, verifying size and checksum.
+/// Decrypt and decompress a raw depot chunk and verify it.
 ///
 /// The chunk format is `ECB(IV, 16 bytes) || CBC(compressed_payload)`. After
 /// decryption, the payload is decompressed based on its magic bytes (Valve zstd,
 /// Valve LZMA, raw LZMA, zip, or uncompressed). The result is verified against
-/// `expected_size` and `expected_checksum` (Steam's zero-seeded Adler-32).
+/// `expected_size`, `expected_checksum` (Steam's zero-seeded Adler-32) and
+/// `expected_id`, which is the SHA-1 of the decompressed data. Adler-32 alone
+/// does not identify content; the SHA-1 check is what catches a server that
+/// returns the wrong chunk. A chunk without an id
+/// ([`ChunkId::UNIDENTIFIED`]) has nothing to check it against and is accepted
+/// on size and Adler-32.
 pub fn process_chunk(
     data: &[u8],
     depot_key: &DepotKey,
+    expected_id: &ChunkId,
     expected_size: u32,
     expected_checksum: u32,
 ) -> Result<Vec<u8>, ChunkError> {
-    let _ = expected_checksum; // Used after decompress
-    if data.len() < 4 {
-        return Err(ChunkError::TooShort);
-    }
-
     if data.len() < 32 {
         return Err(ChunkError::TooShort);
     }
@@ -103,6 +112,16 @@ pub fn process_chunk(
             expected: expected_checksum,
             actual: checksum.0,
         });
+    }
+
+    if *expected_id != ChunkId::UNIDENTIFIED {
+        let actual = Sha1Hash::compute(&decompressed).0;
+        if actual != expected_id.0 {
+            return Err(ChunkError::Sha1Mismatch {
+                expected: expected_id.0,
+                actual,
+            });
+        }
     }
 
     Ok(decompressed)
@@ -222,7 +241,7 @@ mod tests {
     fn process_chunk_too_short() {
         let key = DepotKey([0; 32]);
         assert!(matches!(
-            process_chunk(b"short", &key, 0, 0),
+            process_chunk(b"short", &key, &ChunkId::UNIDENTIFIED, 0, 0),
             Err(ChunkError::TooShort)
         ));
     }
@@ -241,7 +260,9 @@ mod tests {
         chunk_data.extend_from_slice(&encrypted_iv);
         chunk_data.extend_from_slice(&encrypted_body);
 
-        let result = process_chunk(&chunk_data, &key, plaintext.len() as u32, checksum.0).unwrap();
+        let id = ChunkId(Sha1Hash::compute(plaintext).0);
+        let result =
+            process_chunk(&chunk_data, &key, &id, plaintext.len() as u32, checksum.0).unwrap();
         assert_eq!(result, plaintext);
     }
 
@@ -258,7 +279,13 @@ mod tests {
         chunk_data.extend_from_slice(&encrypted_iv);
         chunk_data.extend_from_slice(&encrypted_body);
 
-        let result = process_chunk(&chunk_data, &key, plaintext.len() as u32, 0xDEADBEEF);
+        let result = process_chunk(
+            &chunk_data,
+            &key,
+            &ChunkId::UNIDENTIFIED,
+            plaintext.len() as u32,
+            0xDEADBEEF,
+        );
         assert!(matches!(result, Err(ChunkError::ChecksumMismatch { .. })));
     }
 
@@ -276,7 +303,58 @@ mod tests {
         chunk_data.extend_from_slice(&encrypted_iv);
         chunk_data.extend_from_slice(&encrypted_body);
 
-        let result = process_chunk(&chunk_data, &wrong_key, plaintext.len() as u32, 0);
+        let result = process_chunk(
+            &chunk_data,
+            &wrong_key,
+            &ChunkId::UNIDENTIFIED,
+            plaintext.len() as u32,
+            0,
+        );
         assert!(result.is_err());
+    }
+
+    fn encrypt_uncompressed(plaintext: &[u8], key: &DepotKey) -> Vec<u8> {
+        let iv = [0x42u8; 16];
+        let mut chunk_data = crate::crypto::symmetric_encrypt_ecb_nopad(&iv, &key.0).unwrap();
+        chunk_data.extend_from_slice(
+            &crate::crypto::symmetric_encrypt_cbc(plaintext, &key.0, &iv).unwrap(),
+        );
+        chunk_data
+    }
+
+    #[test]
+    fn process_chunk_rejects_content_that_is_not_the_requested_chunk() {
+        // Same size and Adler-32 as the requested chunk would pass the older
+        // checks; only the id (SHA-1) tells them apart.
+        let key = DepotKey([0xAA; 32]);
+        let served = b"wrong chunk data";
+        let requested = ChunkId(Sha1Hash::compute(b"right chunk data").0);
+        let checksum = SteamAdler32::compute(served).0;
+        let result = process_chunk(
+            &encrypt_uncompressed(served, &key),
+            &key,
+            &requested,
+            served.len() as u32,
+            checksum,
+        );
+        assert!(matches!(
+            result,
+            Err(ChunkError::Sha1Mismatch { expected, .. }) if expected == requested.0
+        ));
+    }
+
+    #[test]
+    fn process_chunk_without_an_id_skips_the_sha1_check() {
+        let key = DepotKey([0xAA; 32]);
+        let data = b"anonymous chunk!";
+        let result = process_chunk(
+            &encrypt_uncompressed(data, &key),
+            &key,
+            &ChunkId::UNIDENTIFIED,
+            data.len() as u32,
+            SteamAdler32::compute(data).0,
+        )
+        .unwrap();
+        assert_eq!(result, data);
     }
 }
