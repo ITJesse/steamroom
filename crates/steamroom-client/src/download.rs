@@ -316,6 +316,9 @@ pub struct DepotJob {
     event_tx: Option<mpsc::UnboundedSender<DownloadEvent>>,
     old_manifest_files: Option<Vec<String>>,
     old_file_layouts: Option<std::collections::HashMap<String, Vec<OldChunkLoc>>>,
+    /// Where the paths of `old_file_layouts` live, when not in the install
+    /// directory.
+    reuse_dir: Option<PathBuf>,
 
     /// Per-chunk reuse decisions tallied during a run. Test-only: it exists so
     /// tests can assert *how* a file was assembled (fetched vs. reused vs.
@@ -801,7 +804,7 @@ impl DepotJob {
             &ReuseSources {
                 reuse_from,
                 output_path,
-                install_dir: &self.install_dir,
+                reuse_dir: self.reuse_dir.as_deref().unwrap_or(&self.install_dir),
                 cas,
             },
             &file.chunks,
@@ -1159,7 +1162,7 @@ struct ReuseSources<'a> {
     /// The file being written; never read as a source (unsafe mid-write).
     output_path: &'a Path,
     /// Root the CAS's relative paths resolve against.
-    install_dir: &'a Path,
+    reuse_dir: &'a Path,
     /// Content-addressed store over the whole previous install.
     cas: &'a Cas,
 }
@@ -1174,7 +1177,7 @@ fn plan_reuse(
     let ReuseSources {
         reuse_from,
         output_path,
-        install_dir,
+        reuse_dir,
         cas,
     } = *src;
     let cap = chunks
@@ -1237,10 +1240,12 @@ fn plan_reuse(
         if let Some(loc) = cas.get(id)
             && loc.size as usize == size
         {
-            let abs = install_dir.join(&loc.rel_path);
+            // A path that would leave the reuse directory is never read.
+            let abs = contained_relative(&loc.rel_path).map(|rel| reuse_dir.join(rel));
             // Never read the file we are writing in place; step 1 already
             // covered its same-offset bytes and a mid-write read is unsafe.
-            if abs != output_path
+            if let Some(abs) = abs
+                && abs != output_path
                 && let Some(idx) = open_source(&abs, &mut sources, &mut by_path)
                 && chunk_matches(&sources[idx], &mut buf[..size], loc.offset, id)
             {
@@ -1638,6 +1643,7 @@ pub struct DepotJobBuilder {
     event_tx: Option<mpsc::UnboundedSender<DownloadEvent>>,
     old_manifest_files: Option<Vec<String>>,
     old_file_layouts: Option<std::collections::HashMap<String, Vec<OldChunkLoc>>>,
+    reuse_dir: Option<PathBuf>,
 }
 
 impl DepotJobBuilder {
@@ -1702,6 +1708,16 @@ impl DepotJobBuilder {
         self
     }
 
+    /// Directory the paths of [`old_file_layouts`](Self::old_file_layouts)
+    /// are relative to, when the previous install is not the install
+    /// directory: an update can then write into an empty staging directory
+    /// and still copy unchanged chunks from the installed files. Defaults to
+    /// the install directory. Paths that would leave it are ignored.
+    pub fn reuse_dir(mut self, dir: PathBuf) -> Self {
+        self.reuse_dir = Some(dir);
+        self
+    }
+
     pub fn build(self) -> Result<DepotJob, BuildError> {
         Ok(DepotJob {
             depot_id: self.depot_id.ok_or(BuildError::MissingDepotId)?,
@@ -1715,6 +1731,7 @@ impl DepotJobBuilder {
             event_tx: self.event_tx,
             old_manifest_files: self.old_manifest_files,
             old_file_layouts: self.old_file_layouts,
+            reuse_dir: self.reuse_dir,
             #[cfg(test)]
             checkpoints: Arc::new(ReuseCheckpoints::default()),
         })

@@ -1497,6 +1497,113 @@ async fn content_addressed_reuse_copies_across_files() {
 }
 
 #[tokio::test]
+async fn reuse_dir_feeds_a_separate_staging_directory() {
+    // An update writes the changed file into an empty staging directory; the
+    // installed copy lives elsewhere, under its own (renamed) path. Unchanged
+    // chunks come from there, and nothing is written outside the staging
+    // directory.
+    let dir = tempfile::tempdir().unwrap();
+    let installed = dir.path().join("story");
+    let staging = dir.path().join("staging");
+    std::fs::create_dir_all(installed.join("game")).unwrap();
+    let key = DepotKey([0xAA; 32]);
+
+    let kept = b"kept block 16 by";
+    let changed = b"changed block!!!";
+    std::fs::write(installed.join("game/script.rpa"), kept).unwrap();
+
+    let mut old_layouts = HashMap::new();
+    old_layouts.insert(
+        "game/script.rpa".to_string(),
+        vec![crate::download::OldChunkLoc {
+            id: sha_id(kept),
+            offset: 0,
+            size: kept.len() as u32,
+        }],
+    );
+    let manifest = DepotManifest::new(vec![file_with_chunks(
+        "Game\\script.rpa",
+        vec![chunk_at(kept, 0), chunk_at(changed, kept.len() as u64)],
+    )]);
+
+    let mut allowed = HashMap::new();
+    allowed.insert(sha_id(changed), enc(changed, &key));
+
+    let job = DepotJob::builder()
+        .depot_id(anon::SPACEWAR_DEPOT)
+        .depot_key(key)
+        .install_dir(staging.clone())
+        .non_atomic(true)
+        .old_file_layouts(old_layouts)
+        .reuse_dir(installed.clone())
+        .build()
+        .unwrap();
+
+    let cp = job.checkpoints();
+    job.download(&manifest, Arc::new(SelectiveFetcher { allowed }))
+        .await
+        .unwrap();
+
+    let expected = [&kept[..], &changed[..]].concat();
+    assert_eq!(
+        std::fs::read(staging.join("Game/script.rpa")).unwrap(),
+        expected
+    );
+    assert_eq!(
+        std::fs::read(installed.join("game/script.rpa")).unwrap(),
+        kept
+    );
+    // `kept` copied from the installed file, `changed` fetched.
+    assert_eq!(cp.snapshot(), (0, 1, 1));
+}
+
+#[tokio::test]
+async fn reuse_paths_never_leave_the_reuse_directory() {
+    // A layout path with `..` must not be read even when a file with the
+    // wanted bytes sits there.
+    let dir = tempfile::tempdir().unwrap();
+    let reuse = dir.path().join("reuse");
+    let staging = dir.path().join("staging");
+    std::fs::create_dir_all(&reuse).unwrap();
+    let key = DepotKey([0xAA; 32]);
+
+    let wanted = b"the wanted block";
+    std::fs::write(dir.path().join("outside.bin"), wanted).unwrap();
+
+    let mut old_layouts = HashMap::new();
+    old_layouts.insert(
+        "../outside.bin".to_string(),
+        vec![crate::download::OldChunkLoc {
+            id: sha_id(wanted),
+            offset: 0,
+            size: wanted.len() as u32,
+        }],
+    );
+    let manifest = DepotManifest::new(vec![file_with_chunks("b.bin", vec![chunk_at(wanted, 0)])]);
+
+    let mut chunks = HashMap::new();
+    chunks.insert(sha_id(wanted), enc(wanted, &key));
+
+    let job = DepotJob::builder()
+        .depot_id(anon::SPACEWAR_DEPOT)
+        .depot_key(key)
+        .install_dir(staging.clone())
+        .non_atomic(true)
+        .old_file_layouts(old_layouts)
+        .reuse_dir(reuse)
+        .build()
+        .unwrap();
+
+    let cp = job.checkpoints();
+    job.download(&manifest, Arc::new(MockFetcher { chunks }))
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(staging.join("b.bin")).unwrap(), wanted);
+    assert_eq!(cp.snapshot(), (0, 0, 1));
+}
+
+#[tokio::test]
 async fn evicted_cas_source_falls_back_to_fetch() {
     // The CAS claims a chunk lives in a file that, on disk, no longer holds
     // those bytes (evicted/overwritten). Verification must fail and the chunk
