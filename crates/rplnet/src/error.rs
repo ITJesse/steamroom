@@ -30,6 +30,9 @@ pub enum RplnetError {
         reason: RplnetDiskFailure,
         detail: String,
     },
+    /// The app cancelled the operation; nothing to show.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -60,6 +63,9 @@ pub enum RplnetAuthFailure {
     SessionExpired,
     /// Too many attempts; Steam refuses logins for a while.
     RateLimited,
+    /// The pending sign-in ended: it was denied in the Steam mobile app or
+    /// waited too long. Start over.
+    RequestEnded,
     /// Logon refused for another reason, named by Steam's EResult.
     Rejected { eresult: String },
 }
@@ -82,28 +88,28 @@ pub enum RplnetDiskFailure {
 }
 
 impl RplnetError {
-    fn network(reason: RplnetNetworkFailure, detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn network(reason: RplnetNetworkFailure, detail: impl std::fmt::Display) -> Self {
         Self::Network {
             reason,
             detail: redact(&detail.to_string()),
         }
     }
 
-    fn auth(reason: RplnetAuthFailure, detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn auth(reason: RplnetAuthFailure, detail: impl std::fmt::Display) -> Self {
         Self::Auth {
             reason,
             detail: redact(&detail.to_string()),
         }
     }
 
-    fn steam(reason: RplnetSteamFailure, detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn steam(reason: RplnetSteamFailure, detail: impl std::fmt::Display) -> Self {
         Self::Steam {
             reason,
             detail: redact(&detail.to_string()),
         }
     }
 
-    fn disk(reason: RplnetDiskFailure, detail: impl std::fmt::Display) -> Self {
+    pub(crate) fn disk(reason: RplnetDiskFailure, detail: impl std::fmt::Display) -> Self {
         Self::Disk {
             reason,
             detail: redact(&detail.to_string()),
@@ -262,6 +268,7 @@ mod tests {
             RplnetError::Auth { reason, .. } => format!("auth {reason:?}"),
             RplnetError::Steam { reason, .. } => format!("steam {reason:?}"),
             RplnetError::Disk { reason, .. } => format!("disk {reason:?}"),
+            RplnetError::Cancelled => "cancelled".to_string(),
         }
     }
 

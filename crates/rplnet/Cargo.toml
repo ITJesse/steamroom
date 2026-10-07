@@ -1,6 +1,6 @@
 [package]
 name = "rplnet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "RenPyLinter's Steam layer: a UniFFI surface over steamroom for the iOS app"
@@ -14,10 +14,15 @@ crate-type = ["staticlib", "lib"]
 [dependencies]
 steamroom = { workspace = true }
 steamroom-client = { workspace = true }
+base64 = { workspace = true }
+prost = { workspace = true }
 reqwest = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uniffi = { version = "0.32", features = ["tokio"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

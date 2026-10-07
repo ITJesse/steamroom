@@ -8,6 +8,8 @@
 
 pub mod error;
 pub mod log;
+mod net;
+pub mod steam;
 
 uniffi::setup_scaffolding!();
 

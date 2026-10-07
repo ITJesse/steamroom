@@ -2779,13 +2779,17 @@ dependencies = [
 
 [[package]]
 name = "rplnet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "base64",
+ "prost",
  "reqwest",
+ "serde_json",
  "steamroom",
  "steamroom-client",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uniffi",
 ]
