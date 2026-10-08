@@ -2,6 +2,11 @@
 //! implements, so they end up in the app's own log. Messages are redacted
 //! before they leave Rust: URL queries (CDN auth tokens travel there) and
 //! JWTs (Steam access and refresh tokens) are replaced.
+//!
+//! Only rplnet's and steamroom's own events follow the sink's level. The
+//! crates under them (HTTP/2, connection pools, TLS, WebSocket) log every
+//! frame and connection at debug level, thousands of events per downloaded
+//! game, so theirs are forwarded from `DEPENDENCY_LEVEL` up.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -68,6 +73,11 @@ pub enum RplnetLogSinkError {
     SubscriberAlreadySet,
 }
 
+/// Crates whose events follow the sink's level.
+const OWN_CRATES: [&str; 3] = ["rplnet", "steamroom", "steamroom_client"];
+/// The most verbose level forwarded from any other crate.
+const DEPENDENCY_LEVEL: RplnetLogLevel = RplnetLogLevel::Warn;
+
 static SINK: RwLock<Option<Arc<dyn RplnetLogSink>>> = RwLock::new(None);
 static MAX_RANK: AtomicU8 = AtomicU8::new(0);
 static INSTALLED: OnceLock<bool> = OnceLock::new();
@@ -92,14 +102,27 @@ pub fn rplnet_set_log_sink(
 
 struct Bridge;
 
+/// Whether `target` (a module path) is in one of `OWN_CRATES`.
+fn is_own(target: &str) -> bool {
+    let krate = target.split("::").next().unwrap_or(target);
+    OWN_CRATES.contains(&krate)
+}
+
 impl Subscriber for Bridge {
-    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if !is_own(metadata.target())
+            && RplnetLogLevel::from_tracing(metadata.level()) > DEPENDENCY_LEVEL
+        {
+            return Interest::never();
+        }
         // The level can change at runtime, so ask `enabled` every time.
         Interest::sometimes()
     }
 
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        RplnetLogLevel::from_tracing(metadata.level()).rank() <= MAX_RANK.load(Ordering::Relaxed)
+        let level = RplnetLogLevel::from_tracing(metadata.level());
+        level.rank() <= MAX_RANK.load(Ordering::Relaxed)
+            && (level <= DEPENDENCY_LEVEL || is_own(metadata.target()))
     }
 
     // Spans carry no information the app logs; they are accepted and ignored.
@@ -288,6 +311,30 @@ mod tests {
         // Raising the level takes effect without reinstalling.
         rplnet_set_log_sink(capture.clone(), RplnetLogLevel::Debug).unwrap();
         tracing::debug!("now visible");
-        assert_eq!(capture.0.lock().unwrap().len(), 2);
+        tracing::debug!(target: "steamroom::cdn", "steamroom follows the level");
+        // Other crates only from warn up, whatever the level.
+        tracing::debug!(target: "h2::codec::framed_read", "received frame");
+        tracing::info!(target: "hyper_util::client::legacy::pool", "reuse idle connection");
+        tracing::warn!(target: "hyper_util::client::legacy::pool", "connection error");
+        let targets: Vec<String> = capture.0.lock().unwrap()[1..]
+            .iter()
+            .map(|record| record.target.clone())
+            .collect();
+        assert_eq!(targets.len(), 3);
+        assert!(targets[0].starts_with("rplnet"));
+        assert_eq!(
+            targets[1..],
+            ["steamroom::cdn", "hyper_util::client::legacy::pool"]
+        );
+    }
+
+    #[test]
+    fn own_crates_are_told_by_the_first_path_segment() {
+        assert!(is_own("rplnet"));
+        assert!(is_own("rplnet::steam::content"));
+        assert!(is_own("steamroom::transport::tcp"));
+        assert!(is_own("steamroom_client::download"));
+        assert!(!is_own("h2::codec::framed_read"));
+        assert!(!is_own("steamroomx::y"));
     }
 }
