@@ -42,8 +42,8 @@ pub struct RplnetOwnedGame {
     pub build_id: Option<u32>,
     /// When the public branch got that build, in seconds since 1970.
     pub build_time: Option<i64>,
-    /// Every license for it belongs to another account (Steam Family); its
-    /// content cannot be downloaded with this account.
+    /// Every license for it belongs to another account: it is borrowed
+    /// through Steam Family. Its content downloads like an owned game's.
     pub family_shared: bool,
     /// Tagged "Visual Novel" on the store.
     pub visual_novel: bool,
@@ -53,13 +53,13 @@ pub struct RplnetOwnedGame {
     /// Depots worth inspecting, best first (plan 6.5). DLC depots are not
     /// among them; they are in `dlc`.
     pub depots: Vec<RplnetDepotCandidate>,
-    /// DLC of the game the account owns (not through Steam Family) that has
-    /// content to install with it.
+    /// DLC of the game the account has a license for, of its own or through
+    /// Steam Family, that has content to install with it.
     pub dlc: Vec<RplnetDlc>,
 }
 
-/// A DLC the account owns, with the depots it installs into the game's
-/// directory.
+/// A DLC the account has a license for, with the depots it installs into
+/// the game's directory.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct RplnetDlc {
     pub app_id: u32,
@@ -137,9 +137,6 @@ pub(crate) struct Ownership {
     shared_packages: BTreeSet<u32>,
     /// Depots an owned or shared package lists.
     owned_depots: BTreeSet<u32>,
-    /// Apps a package of the account's own grants: their content can be
-    /// downloaded with it.
-    own_apps: BTreeSet<u32>,
     package_count: usize,
 }
 
@@ -176,7 +173,6 @@ impl Ownership {
             app_packages: BTreeMap::new(),
             shared_packages,
             owned_depots: BTreeSet::new(),
-            own_apps: BTreeSet::new(),
             package_count: packages.len(),
         };
         for package in &packages {
@@ -192,16 +188,12 @@ impl Ownership {
     }
 
     fn add_package(&mut self, package_id: u32, kv: &KeyValue) {
-        let shared = self.shared_packages.contains(&package_id);
         for depot in numbers(kv.get("depotids")) {
             self.owned_depots.insert(depot as u32);
         }
         for app in numbers(kv.get("appids")) {
             let app = app as u32;
             self.app_packages.entry(app).or_default().push(package_id);
-            if !shared {
-                self.own_apps.insert(app);
-            }
         }
     }
 
@@ -213,6 +205,11 @@ impl Ownership {
                     .iter()
                     .all(|package| self.shared_packages.contains(package))
         })
+    }
+
+    /// A package of the account's own or a family member's grants the app.
+    fn licenses(&self, app_id: u32) -> bool {
+        self.app_packages.contains_key(&app_id)
     }
 }
 
@@ -299,18 +296,19 @@ fn game_from(
         visual_novel: numbers(common.get("store_tags")).any(|tag| tag == VISUAL_NOVEL_TAG),
         header_image_url,
         depots: rank_depots(kv.get("depots"), &ownership.owned_depots),
-        dlc: owned_dlc(kv.get("depots"), &ownership.own_apps, dlc_names),
+        dlc: licensed_dlc(kv.get("depots"), ownership, dlc_names),
     })
 }
 
-/// The DLC depots of a game's `depots` node whose DLC is in `own_apps`, by
-/// DLC. Depots shared from another app or installed shared, low-violence
-/// variants, language variants (no way to tell which one belongs with the
-/// game's files) and depots without a public manifest are left out, and so
-/// is a DLC left with no depot.
-fn owned_dlc(
+/// The DLC depots of a game's `depots` node whose DLC `ownership` licenses
+/// (of the account's own or through Steam Family), by DLC. Depots shared
+/// from another app or installed shared, low-violence variants, language
+/// variants (no way to tell which one belongs with the game's files) and
+/// depots without a public manifest are left out, and so is a DLC left with
+/// no depot.
+fn licensed_dlc(
     depots: Option<&KeyValue>,
-    own_apps: &BTreeSet<u32>,
+    ownership: &Ownership,
     names: &BTreeMap<u32, String>,
 ) -> Vec<RplnetDlc> {
     let Some(KvValue::Children(depots)) = depots.map(|d| &d.value) else {
@@ -324,7 +322,7 @@ fn owned_dlc(
         let Some(dlc) = number(depot.get("dlcappid")).map(|dlc| dlc as u32) else {
             continue;
         };
-        if !own_apps.contains(&dlc) || !installs_with_the_game(depot) {
+        if !ownership.licenses(dlc) || !installs_with_the_game(depot) {
             continue;
         }
         let config = depot.get("config");
@@ -368,7 +366,7 @@ fn installs_with_the_game(depot: &KeyValue) -> bool {
 /// packages before the rest; then no `oslist` (every platform), Linux,
 /// Windows, macOS; then no `language` before a language. Depots shared from
 /// another app or installed shared (redistributables), low-violence variants,
-/// DLC depots (`owned_dlc`) and depots without a public manifest are left
+/// DLC depots (`licensed_dlc`) and depots without a public manifest are left
 /// out.
 fn rank_depots(
     depots: Option<&KeyValue>,
@@ -429,7 +427,7 @@ pub struct RplnetAppVersion {
     pub build_time: Option<i64>,
     /// Every depot with a public manifest.
     pub depots: Vec<RplnetDepotVersion>,
-    /// DLC the account owns now, as `RplnetOwnedGame::dlc`.
+    /// DLC the account has a license for now, as `RplnetOwnedGame::dlc`.
     pub dlc: Vec<RplnetDlc>,
 }
 
@@ -463,10 +461,10 @@ pub(crate) async fn app_versions(
             ))
         })
         .collect();
-    // Owned DLC of these apps, for their names.
+    // Licensed DLC of these apps, for their names.
     let dlc_ids: BTreeSet<u32> = parsed
         .iter()
-        .flat_map(|(_, _, kv)| owned_dlc(kv.get("depots"), &ownership.own_apps, &BTreeMap::new()))
+        .flat_map(|(_, _, kv)| licensed_dlc(kv.get("depots"), &ownership, &BTreeMap::new()))
         .map(|dlc| dlc.app_id)
         .collect();
     let names = if dlc_ids.is_empty() {
@@ -479,12 +477,12 @@ pub(crate) async fn app_versions(
         .iter()
         .map(|(app_id, change_number, kv)| {
             let mut version = app_version(*app_id, *change_number, kv);
-            version.dlc = owned_dlc(kv.get("depots"), &ownership.own_apps, &names);
+            version.dlc = licensed_dlc(kv.get("depots"), &ownership, &names);
             version
         })
         .collect();
     info!(
-        "app versions: {} of {} apps, {} owned DLC, in {} ms",
+        "app versions: {} of {} apps, {} licensed DLC, in {} ms",
         versions.len(),
         app_ids.len(),
         versions
@@ -673,7 +671,6 @@ mod tests {
             app_packages: BTreeMap::new(),
             shared_packages: [2].into(),
             owned_depots: owned_depots.iter().copied().collect(),
-            own_apps: BTreeSet::new(),
             package_count: 2,
         };
         let list = |items: &[u32]| {
@@ -825,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_dlc_lists_every_platform_but_no_variants() {
+    fn licensed_dlc_lists_every_platform_but_no_variants() {
         let config = |items: Vec<KeyValue>| children("config", items);
         let kv = app(vec![
             depot("101", vec![], "11"),
@@ -848,7 +845,7 @@ mod tests {
                 "34",
             ),
             children("305", vec![s("dlcappid", "300")]),
-            // DLC 400 is not owned; DLC 500 only through Steam Family.
+            // DLC 400 has no license; DLC 500 one through Steam Family.
             depot("401", vec![s("dlcappid", "400")], "41"),
             depot("501", vec![s("dlcappid", "500")], "51"),
         ]);
@@ -863,22 +860,33 @@ mod tests {
         .unwrap();
         assert_eq!(
             game.dlc,
-            vec![RplnetDlc {
-                app_id: 300,
-                name: "Extra".to_string(),
-                depots: vec![
-                    RplnetDepotVersion {
-                        depot_id: 301,
-                        manifest_id: 31,
+            vec![
+                RplnetDlc {
+                    app_id: 300,
+                    name: "Extra".to_string(),
+                    depots: vec![
+                        RplnetDepotVersion {
+                            depot_id: 301,
+                            manifest_id: 31,
+                            size: Some(1000)
+                        },
+                        RplnetDepotVersion {
+                            depot_id: 302,
+                            manifest_id: 32,
+                            size: Some(1000)
+                        },
+                    ],
+                },
+                RplnetDlc {
+                    app_id: 500,
+                    name: "App 500".to_string(),
+                    depots: vec![RplnetDepotVersion {
+                        depot_id: 501,
+                        manifest_id: 51,
                         size: Some(1000)
-                    },
-                    RplnetDepotVersion {
-                        depot_id: 302,
-                        manifest_id: 32,
-                        size: Some(1000)
-                    },
-                ],
-            }]
+                    }],
+                }
+            ]
         );
         assert_eq!(
             game.depots.iter().map(|d| d.depot_id).collect::<Vec<_>>(),
@@ -888,10 +896,27 @@ mod tests {
 
     #[test]
     fn family_shared_when_every_package_is_shared() {
-        let kv = app(vec![]);
-        let shared_only = ownership(&[], &[], &[100]);
+        let kv = app(vec![
+            depot("101", vec![], "11"),
+            depot("301", vec![s("dlcappid", "300")], "31"),
+            depot("401", vec![s("dlcappid", "400")], "41"),
+        ]);
+        let shared_only = ownership(&[101], &[400], &[100, 300]);
         let game = game_from(100, 7, &kv, &shared_only, &BTreeMap::new(), "english").unwrap();
         assert!(game.family_shared);
+        // A borrowed game is inspected and downloaded like an owned one,
+        // with the DLC of every license.
+        assert_eq!(
+            game.depots
+                .iter()
+                .map(|d| (d.depot_id, d.owned))
+                .collect::<Vec<_>>(),
+            vec![(101, true)]
+        );
+        assert_eq!(
+            game.dlc.iter().map(|d| d.app_id).collect::<Vec<_>>(),
+            vec![300, 400]
+        );
         let both = ownership(&[], &[100], &[100]);
         let game = game_from(100, 7, &kv, &both, &BTreeMap::new(), "english").unwrap();
         assert!(!game.family_shared);
