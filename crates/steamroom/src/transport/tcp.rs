@@ -51,7 +51,7 @@ impl Transport for TcpTransport {
         let payload_len = payload.len();
         let frame = framing::Frame::encode(payload);
         Box::pin(async move {
-            tracing::debug!(
+            tracing::trace!(
                 "tcp send: {} bytes payload, {} bytes frame",
                 payload_len,
                 frame.len()

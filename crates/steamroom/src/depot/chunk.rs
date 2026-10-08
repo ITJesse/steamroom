@@ -89,7 +89,7 @@ pub fn process_chunk(
     let decrypted = crate::crypto::symmetric_decrypt_cbc(&data[16..], &depot_key.0, &iv)?;
 
     // Detect compression and decompress
-    tracing::debug!(
+    tracing::trace!(
         "chunk decrypted: {} bytes, first 20: {:02x?}, compression: {:?}",
         decrypted.len(),
         &decrypted[..decrypted.len().min(20)],
