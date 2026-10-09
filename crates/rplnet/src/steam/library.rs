@@ -47,6 +47,8 @@ pub struct RplnetOwnedGame {
     pub family_shared: bool,
     /// Tagged "Visual Novel" on the store.
     pub visual_novel: bool,
+    /// A demo, not the full game.
+    pub demo: bool,
     /// The store's header image (460×215), in the requested language when
     /// there is one.
     pub header_image_url: Option<String>,
@@ -268,8 +270,9 @@ fn app_name(app_id: u32, common: &KeyValue, language: &str) -> String {
 }
 
 /// The game described by an app's PICS info, or `None` for anything but a
-/// game (DLC, tools, demos, applications, …). `dlc_names` names the owned
-/// DLC apps.
+/// game or a demo (DLC, tools, applications, …). A demo is its own app with
+/// its own depots, downloaded like a game; Steam lists it once the account
+/// has added it. `dlc_names` names the owned DLC apps.
 fn game_from(
     app_id: u32,
     change_number: u32,
@@ -279,7 +282,8 @@ fn game_from(
     language: &str,
 ) -> Option<RplnetOwnedGame> {
     let common = kv.get("common")?;
-    if !text(common.get("type"))?.eq_ignore_ascii_case("game") {
+    let app_type = text(common.get("type"))?;
+    if !is_listed_type(&app_type) {
         return None;
     }
     let name = app_name(app_id, common, language);
@@ -294,10 +298,20 @@ fn game_from(
         build_time: public_build_time(kv),
         family_shared: ownership.family_shared(app_id),
         visual_novel: numbers(common.get("store_tags")).any(|tag| tag == VISUAL_NOVEL_TAG),
+        demo: is_demo_type(&app_type),
         header_image_url,
         depots: rank_depots(kv.get("depots"), &ownership.owned_depots),
         dlc: licensed_dlc(kv.get("depots"), ownership, dlc_names),
     })
+}
+
+/// App types listed in the library: games and their demos.
+fn is_listed_type(app_type: &str) -> bool {
+    app_type.eq_ignore_ascii_case("game") || is_demo_type(app_type)
+}
+
+fn is_demo_type(app_type: &str) -> bool {
+    app_type.eq_ignore_ascii_case("demo")
 }
 
 /// The DLC depots of a game's `depots` node whose DLC `ownership` licenses
@@ -774,7 +788,28 @@ mod tests {
     }
 
     #[test]
-    fn only_games_are_listed() {
+    fn demos_are_listed_like_games() {
+        let mut kv = app(vec![]);
+        if let KvValue::Children(root) = &mut kv.value
+            && let Some(KvValue::Children(common)) = root.get_mut("common").map(|c| &mut c.value)
+        {
+            common.insert("type".into(), s("type", "Demo"));
+        }
+        let game = game_from(
+            100,
+            7,
+            &kv,
+            &ownership(&[], &[100], &[]),
+            &BTreeMap::new(),
+            "english",
+        )
+        .expect("a demo is listed");
+        assert_eq!(game.app_id, 100);
+        assert!(game.demo);
+    }
+
+    #[test]
+    fn only_games_and_demos_are_listed() {
         let mut kv = app(vec![]);
         if let KvValue::Children(root) = &mut kv.value
             && let Some(KvValue::Children(common)) = root.get_mut("common").map(|c| &mut c.value)

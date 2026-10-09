@@ -792,6 +792,7 @@ async fn owned_games_come_from_licenses_packages_and_app_info() {
     assert_eq!(games[0].name, "中文Owned");
     assert!(!games[0].family_shared);
     assert!(games[0].visual_novel);
+    assert!(!games[0].demo);
     assert_eq!(
         games[0].depots,
         vec![super::library::RplnetDepotCandidate {
